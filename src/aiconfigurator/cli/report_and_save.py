@@ -4,6 +4,7 @@
 import logging
 import os
 import random
+import re
 import traceback
 
 import matplotlib.pyplot as plt
@@ -24,6 +25,26 @@ from aiconfigurator.sdk.task import TaskConfig
 from aiconfigurator.sdk.utils import safe_mkdir
 
 logger = logging.getLogger(__name__)
+
+
+def _format_model_path_for_result_prefix(model_path: str) -> str:
+    """Convert model path/id into a safe single path component for result folders."""
+    raw = str(model_path or "").strip()
+    if not raw:
+        return "model"
+
+    # For absolute local paths, use leaf directory/file name.
+    # This prevents os.path.join(save_dir, prefix) from being overridden by absolute prefixes.
+    if os.path.isabs(raw):
+        raw = os.path.basename(raw.rstrip("/\\"))
+
+    # Keep HF-style namespaces and other ids readable, but collapse separators/special chars.
+    safe = raw.replace("\\", "_").replace("/", "_")
+    safe = re.sub(r"[^\w\-_.]", "_", safe)
+    safe = safe.strip("._ ")
+    if not safe:
+        return "model"
+    return safe[:100]
 
 
 def _check_power_data_available(best_configs: dict[str, pd.DataFrame], threshold: float = 0.9) -> bool:
@@ -451,8 +472,9 @@ def save_results(
 
     backend_str = backend or first_task.backend_name
 
+    model_name_for_prefix = _format_model_path_for_result_prefix(first_task_config.model_path)
     result_prefix = (
-        f"{first_task_config.model_path}_{first_task.system_name}_{backend_str}_"
+        f"{model_name_for_prefix}_{first_task.system_name}_{backend_str}_"
         f"isl{first_task_config.runtime_config.isl}_osl{first_task_config.runtime_config.osl}_"
         f"ttft{int(first_task_config.runtime_config.ttft)}_tpot{int(first_task_config.runtime_config.tpot)}"
     )
