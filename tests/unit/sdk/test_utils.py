@@ -110,6 +110,34 @@ class TestParseHFConfig:
 
         assert result["d"] == 80  # head_dim
 
+    def test_parse_hunyuan_dense_config(self):
+        """Test parsing Hunyuan Dense config from reprompt model."""
+        config = {
+            "architectures": ["HunYuanDenseV1ForCausalLM"],
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 8,
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "intermediate_size": 14336,
+            "vocab_size": 151936,
+            "max_position_embeddings": 32768,
+            "num_experts_per_tok": 0,
+            "model_type": "hunyuan_v1_dense",
+        }
+
+        result = _parse_hf_config_json(config)
+
+        assert result["architecture"] == "HunYuanDenseV1ForCausalLM"  # architecture
+        assert result["layers"] == 32  # num_layers
+        assert result["n"] == 32  # num_heads
+        assert result["n_kv"] == 8  # num_kv_heads
+        assert result["hidden_size"] == 4096  # hidden_size
+        assert result["inter_size"] == 14336  # inter_size
+        assert result["vocab"] == 151936  # vocab_size
+        assert result["context"] == 32768  # max_position_embeddings
+        assert result["topk"] == 0  # dense model, not MoE
+        assert result["num_experts"] == 0  # dense model, not MoE
+
     def test_parse_nemotronh_config(self):
         """Test parsing a NemotronH hybrid model config (Mamba + MoE + Transformer)."""
         config = {

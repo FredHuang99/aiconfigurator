@@ -123,6 +123,16 @@ class TestHFModelSupport:
         is_moe = check_is_moe(hf_id)
         assert is_moe == is_moe_expected
 
+    @patch("aiconfigurator.sdk.models._get_model_info")
+    def test_hunyuan_dense_architecture_maps_to_llama_family(self, mock_get_model_info):
+        """HunYuan dense architecture should follow LLAMA dense model path."""
+        mock_get_model_info.return_value = {
+            "architecture": "HunYuanDenseV1ForCausalLM",
+        }
+
+        family = get_model_family("tencent/HunyuanImage-2.1")
+        assert family == "LLAMA"
+
 
 class TestBackendConfiguration:
     """Test backend configuration."""

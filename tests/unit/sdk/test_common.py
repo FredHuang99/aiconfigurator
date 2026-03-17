@@ -99,3 +99,80 @@ class TestSupportMatrix:
         agg, disagg = common.check_support(model, system, backend, version, architecture)
         assert agg is expected_agg
         assert disagg is expected_disagg
+
+    def test_check_support_family_fallback_for_hunyuan_dense(self, monkeypatch):
+        """Unknown architecture rows should fall back to architecture-family majority vote."""
+        fake_matrix = [
+            {
+                "HuggingFaceID": "Qwen/Qwen3-32B",
+                "Architecture": "Qwen3ForCausalLM",
+                "System": "h100_sxm",
+                "Backend": "trtllm",
+                "Version": "1.2.0rc5",
+                "Mode": "agg",
+                "Status": "PASS",
+            },
+            {
+                "HuggingFaceID": "Qwen/Qwen3-8B",
+                "Architecture": "Qwen3ForCausalLM",
+                "System": "h100_sxm",
+                "Backend": "trtllm",
+                "Version": "1.2.0rc5",
+                "Mode": "agg",
+                "Status": "PASS",
+            },
+            {
+                "HuggingFaceID": "meta-llama/Meta-Llama-3.1-8B",
+                "Architecture": "LlamaForCausalLM",
+                "System": "h100_sxm",
+                "Backend": "trtllm",
+                "Version": "1.2.0rc5",
+                "Mode": "agg",
+                "Status": "FAIL",
+            },
+            {
+                "HuggingFaceID": "Qwen/Qwen3-32B",
+                "Architecture": "Qwen3ForCausalLM",
+                "System": "h100_sxm",
+                "Backend": "trtllm",
+                "Version": "1.2.0rc5",
+                "Mode": "disagg",
+                "Status": "PASS",
+            },
+            {
+                "HuggingFaceID": "Qwen/Qwen3-8B",
+                "Architecture": "Qwen3ForCausalLM",
+                "System": "h100_sxm",
+                "Backend": "trtllm",
+                "Version": "1.2.0rc5",
+                "Mode": "disagg",
+                "Status": "PASS",
+            },
+            {
+                "HuggingFaceID": "meta-llama/Meta-Llama-3.1-8B",
+                "Architecture": "LlamaForCausalLM",
+                "System": "h100_sxm",
+                "Backend": "trtllm",
+                "Version": "1.2.0rc5",
+                "Mode": "disagg",
+                "Status": "FAIL",
+            },
+        ]
+        monkeypatch.setattr(common, "get_support_matrix", lambda: fake_matrix)
+
+        result = common.check_support(
+            model="tencent/HunyuanImage-2.1",
+            system="h100_sxm",
+            backend="trtllm",
+            version="1.2.0rc5",
+            architecture="HunYuanDenseV1ForCausalLM",
+        )
+
+        assert result.exact_match is False
+        assert result.agg_supported is True
+        assert result.disagg_supported is True
+        assert result.agg_pass_count == 2
+        assert result.agg_total_count == 3
+        assert result.disagg_pass_count == 2
+        assert result.disagg_total_count == 3
+        assert result.architecture == "HunYuanDenseV1ForCausalLM (family=LLAMA)"

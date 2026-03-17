@@ -113,6 +113,8 @@ def check_support(
     If the model exists in the support matrix, support is determined by the
     matrix entries for that specific model. Otherwise, support is determined
     by a majority vote of PASS status for models sharing the same architecture.
+    If there is no exact architecture match in the matrix, fall back to
+    architecture family (for example, all LLAMA-family dense architectures).
 
     Args:
         model: HuggingFace model ID or local path.
@@ -158,11 +160,30 @@ def check_support(
     if not architecture:
         return SupportResult(agg_supported=False, disagg_supported=False, exact_match=False)
 
+    inferred_architecture_label = architecture
+
     arch_matches = [
         row
         for row in matrix
         if row["Architecture"] == architecture and row["System"] == system and _matches_filters(row, backend, version)
     ]
+
+    # 3. Fallback to architecture-family inference if no direct architecture rows exist.
+    if not arch_matches:
+        family = ARCHITECTURE_TO_MODEL_FAMILY.get(architecture)
+        if family:
+            family_architectures = {
+                arch_name for arch_name, arch_family in ARCHITECTURE_TO_MODEL_FAMILY.items() if arch_family == family
+            }
+            arch_matches = [
+                row
+                for row in matrix
+                if row["Architecture"] in family_architectures
+                and row["System"] == system
+                and _matches_filters(row, backend, version)
+            ]
+            if arch_matches:
+                inferred_architecture_label = f"{architecture} (family={family})"
 
     agg_results = [row["Status"] == "PASS" for row in arch_matches if row["Mode"] == "agg"]
     disagg_results = [row["Status"] == "PASS" for row in arch_matches if row["Mode"] == "disagg"]
@@ -176,7 +197,7 @@ def check_support(
         agg_supported=is_majority_pass(agg_results),
         disagg_supported=is_majority_pass(disagg_results),
         exact_match=False,
-        architecture=architecture,
+        architecture=inferred_architecture_label,
         agg_pass_count=sum(agg_results),
         agg_total_count=len(agg_results),
         disagg_pass_count=sum(disagg_results),
@@ -275,6 +296,7 @@ ARCHITECTURE_TO_MODEL_FAMILY = {
     "LlamaForCausalLM": "LLAMA",
     "Qwen2ForCausalLM": "LLAMA",
     "Qwen3ForCausalLM": "LLAMA",
+    "HunYuanDenseV1ForCausalLM": "LLAMA",
     "DeepSeekForCausalLM": "DEEPSEEK",
     "DeepseekV3ForCausalLM": "DEEPSEEK",
     "KimiK25ForConditionalGeneration": "DEEPSEEK",
