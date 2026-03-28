@@ -160,7 +160,7 @@ def run_single_inference(
 
         row = df.iloc[0]
         return {
-            "model": model.model_path,
+            "model": "tencent--HunyuanImage-2.1--reprompt",
             "architecture": model.architecture,
             "model_family": model.model_family,
             "system": system,
@@ -168,6 +168,7 @@ def run_single_inference(
             "version": version,
             "tp": model.config.tp_size,
             "pp": model.config.pp_size,
+            "dp": model.config.attention_dp_size,
             "isl": isl,
             "osl": osl,
             "batch_size": batch_size,
@@ -179,6 +180,11 @@ def run_single_inference(
             "tokens_per_s_user": float(row.get("tokens/s/user", 0)),
             "memory_gb": float(row.get("memory", 0)),
             "concurrency": int(row.get("concurrency", 0)),
+            "gemm": row.get("gemm", ""),
+            "kvcache": row.get("kvcache", ""),
+            "fmha": row.get("fmha", ""),
+            "power_w": float(row.get("power_w", 0)),
+            "balance_score": float(row.get("balance_score", 0)),
         }
     except Exception as e:
         print(f"    推理失败 (ISL={isl}, OSL={osl}): {e}")

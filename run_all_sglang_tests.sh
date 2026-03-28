@@ -29,6 +29,7 @@ from aiconfigurator.cli.api import cli_default
 import pandas as pd
 
 MODEL_PATH = "/data/projects/myproject/aiconfigurator/enhancer_models/tencent--HunyuanImage-2.1--reprompt"
+MODEL_NAME = "tencent--HunyuanImage-2.1--reprompt"
 ISL_VALUES = [128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048]
 OSL_VALUES = [128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048]
 
@@ -54,7 +55,7 @@ for i, (isl, osl) in enumerate(itertools.product(ISL_VALUES, OSL_VALUES)):
         if agg_df is not None and not agg_df.empty:
             row = agg_df.iloc[0]
             results.append({
-                "model": MODEL_PATH,
+                "model": MODEL_NAME,
                 "system": system,
                 "backend": "sglang",
                 "gpu": gpu,
@@ -67,6 +68,17 @@ for i, (isl, osl) in enumerate(itertools.product(ISL_VALUES, OSL_VALUES)):
                 "request_latency": row.get("request_latency", 0),
                 "memory_gb": row.get("memory", 0),
                 "concurrency": row.get("concurrency", 0),
+                "bs": row.get("bs", 0),
+                "tp": row.get("tp", 0),
+                "pp": row.get("pp", 0),
+                "dp": row.get("dp", 0),
+                "parallel": row.get("parallel", ""),
+                "gemm": row.get("gemm", ""),
+                "kvcache": row.get("kvcache", ""),
+                "fmha": row.get("fmha", ""),
+                "power_w": row.get("power_w", 0),
+                "balance_score": row.get("balance_score", 0),
+                "num_total_gpus": row.get("num_total_gpus", 0),
             })
             print(f"  ISL={isl}, OSL={osl}: TTFT={row.get('ttft', 0):.2f}ms, TPOT={row.get('tpot', 0):.4f}ms, Mem={row.get('memory', 0):.2f}GB")
     except Exception as e:

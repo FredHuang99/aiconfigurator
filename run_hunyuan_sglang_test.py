@@ -70,7 +70,7 @@ def test_single_combination(isl: int, osl: int, gpu: int, system: str) -> dict:
         if agg_df is not None and not agg_df.empty:
             row = agg_df.iloc[0]
             metrics = {
-                "model": ENHANCER_MODEL_PATH,
+                "model": "tencent--HunyuanImage-2.1--reprompt",
                 "system": system,
                 "backend": "sglang",
                 "gpu": gpu,
@@ -83,6 +83,17 @@ def test_single_combination(isl: int, osl: int, gpu: int, system: str) -> dict:
                 "request_latency": row.get("request_latency", 0),
                 "memory_gb": row.get("memory", 0),
                 "concurrency": row.get("concurrency", 0),
+                "bs": row.get("bs", 0),
+                "tp": row.get("tp", 0),
+                "pp": row.get("pp", 0),
+                "dp": row.get("dp", 0),
+                "parallel": row.get("parallel", ""),
+                "gemm": row.get("gemm", ""),
+                "kvcache": row.get("kvcache", ""),
+                "fmha": row.get("fmha", ""),
+                "power_w": row.get("power_w", 0),
+                "balance_score": row.get("balance_score", 0),
+                "num_total_gpus": row.get("num_total_gpus", 0),
             }
             print(f"TTFT={metrics['ttft']:.2f}ms, TPOT={metrics['tpot']:.4f}ms, "
                   f"Tokens/s={metrics['tokens_per_s']:.1f}, Mem={metrics['memory_gb']:.2f}GB")
