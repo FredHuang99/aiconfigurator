@@ -296,6 +296,7 @@ ARCHITECTURE_TO_MODEL_FAMILY = {
     "LlamaForCausalLM": "LLAMA",
     "Qwen2ForCausalLM": "LLAMA",
     "Qwen3ForCausalLM": "LLAMA",
+    "Qwen2_5_VLForConditionalGeneration": "LLAMA",
     "HunYuanDenseV1ForCausalLM": "LLAMA",
     "DeepSeekForCausalLM": "DEEPSEEK",
     "DeepseekV3ForCausalLM": "DEEPSEEK",
