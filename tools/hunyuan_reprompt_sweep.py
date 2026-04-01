@@ -3,9 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Sweep feasible aggregated SGLang points for HunyuanImage-2.1 reprompt.
+Sweep feasible aggregated SGLang points for prompt-enhancer style models.
 
-This script is aimed at the "reprompt" model used as a prompt enhancer.
+This script can profile multiple dense prompt-enhancer presets, including:
+
+- HunyuanImage-2.1 reprompt
+- PromptEnhancer-7B
+- PromptEnhancer-32B
+
 It profiles all feasible `(batch_size, ttft, tpot)` points under:
 
 - system support available in the local AIC repository
@@ -14,8 +19,8 @@ It profiles all feasible `(batch_size, ttft, tpot)` points under:
 
 The script writes:
 
-- feasible_points.csv: every non-OOM point
-- skipped_cases.csv: unsupported systems or sequence-length combinations skipped
+- feasible_points_<model>.csv: every non-OOM point
+- skipped_cases_<model>.csv: unsupported systems or sequence-length combinations skipped
 """
 
 from __future__ import annotations
@@ -29,13 +34,24 @@ from aiconfigurator.sdk.perf_database import get_latest_database_version
 from aiconfigurator.sdk.utils import get_model_config_from_model_path
 
 
-DEFAULT_MODEL_PATH = "/home/heyang/models/promptenhancer-7b"
+DEFAULT_MODEL_PRESET = "promptenhancer_32b"
 DEFAULT_BACKEND = "sglang"
 DEFAULT_DATABASE_MODE = "HYBRID"
 DEFAULT_SYSTEM_ALIASES = ["h200", "h100", "h800", "a100", "a800", "5090", "4090"]
 DEFAULT_ISL_LIST = [128, 256]
 DEFAULT_OSL_LIST = list(range(256, 2049, 128))
 DEFAULT_TP_LIST = [1, 2, 4, 8]
+MODEL_PRESETS = {
+    "promptenhancer_7b": {
+        "model_path": "/home/heyang/models/promptenhancer-7b",
+    },
+    "promptenhancer_32b": {
+        "model_path": "/home/heyang/models/promptenhancer-32b",
+    },
+    "hunyuan_reprompt": {
+        "model_path": "tencent/HunyuanImage-2.1/reprompt",
+    },
+}
 
 # Keep the same dense SGLang batch sweep shape as AIC's agg search path.
 '''
@@ -60,6 +76,16 @@ SYSTEM_ALIAS_TO_AIC = {
 
 def _parse_csv_ints(raw: str) -> list[int]:
     return [int(item.strip()) for item in raw.split(",") if item.strip()]
+
+
+def _sanitize_model_label(label: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in label).strip("_").lower()
+
+
+def _resolve_model_selection(model_preset: str, model_path: str | None) -> tuple[str, str]:
+    preset = MODEL_PRESETS[model_preset]
+    resolved_model_path = model_path or preset["model_path"]
+    return resolved_model_path, _sanitize_model_label(model_preset)
 
 
 def _extract_model_limits(model_path: str, requested_max_osl: int) -> tuple[int, int]:
@@ -115,6 +141,7 @@ def _resolve_supported_systems(system_aliases: list[str], backend: str) -> tuple
 
 def run_sweep(
     *,
+    model_label: str,
     model_path: str,
     backend: str,
     database_mode: str,
@@ -127,8 +154,8 @@ def run_sweep(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    feasible_csv = output_dir / "feasible_points.csv"
-    skipped_csv = output_dir / "skipped_cases.csv"
+    feasible_csv = output_dir / f"feasible_points_{model_label}.csv"
+    skipped_csv = output_dir / f"skipped_cases_{model_label}.csv"
 
     context_limit, output_limit = _extract_model_limits(model_path, requested_max_osl=max(osl_list))
     supported_systems, skipped_records = _resolve_supported_systems(system_aliases, backend)
@@ -198,6 +225,7 @@ def run_sweep(
 
                         feasible_rows.append(
                             {
+                                "model_label": model_label,
                                 "model_path": model_path,
                                 "system_alias": system_alias,
                                 "system_name": system_name,
@@ -222,6 +250,7 @@ def run_sweep(
             f,
             fieldnames=[
                 "model_path",
+                "model_label",
                 "system_alias",
                 "system_name",
                 "backend",
@@ -264,8 +293,9 @@ def run_sweep(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sweep feasible TTFT/TPOT/BS points for HunyuanImage-2.1 reprompt.")
-    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
+    parser = argparse.ArgumentParser(description="Sweep feasible TTFT/TPOT/BS points for prompt-enhancer style models.")
+    parser.add_argument("--model-preset", choices=sorted(MODEL_PRESETS.keys()), default=DEFAULT_MODEL_PRESET)
+    parser.add_argument("--model-path", default=None)
     parser.add_argument("--backend", default=DEFAULT_BACKEND)
     parser.add_argument("--database-mode", default=DEFAULT_DATABASE_MODE)
     parser.add_argument("--systems", default=",".join(DEFAULT_SYSTEM_ALIASES))
@@ -273,11 +303,13 @@ def main() -> None:
     parser.add_argument("--osl", default=",".join(str(v) for v in DEFAULT_OSL_LIST))
     parser.add_argument("--tp", default=",".join(str(v) for v in DEFAULT_TP_LIST))
     parser.add_argument("--batch-candidates", default=",".join(str(v) for v in DEFAULT_BATCH_CANDIDATES))
-    parser.add_argument("--output-dir", default="/home/heyang/outputs/aic")
+    parser.add_argument("--output-dir", default="/home/heyang/outputs/aic2")
     args = parser.parse_args()
+    model_path, model_label = _resolve_model_selection(args.model_preset, args.model_path)
 
     run_sweep(
-        model_path=args.model_path,
+        model_label=model_label,
+        model_path=model_path,
         backend=args.backend,
         database_mode=args.database_mode,
         system_aliases=[item.strip() for item in args.systems.split(",") if item.strip()],

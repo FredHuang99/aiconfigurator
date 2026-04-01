@@ -313,6 +313,7 @@ ARCHITECTURE_TO_MODEL_FAMILY = {
 # Multimodal architectures whose LLM config lives under a nested key (e.g. "text_config").
 # _parse_hf_config_json will flatten these before parsing.
 MULTIMODAL_TEXT_CONFIG_KEY = {
+    "Qwen2_5_VLForConditionalGeneration": "text_config",
     "KimiK25ForConditionalGeneration": "text_config",
 }
 

@@ -138,6 +138,43 @@ class TestParseHFConfig:
         assert result["topk"] == 0  # dense model, not MoE
         assert result["num_experts"] == 0  # dense model, not MoE
 
+    def test_parse_qwen25_vl_config_uses_text_config(self):
+        """Test parsing Qwen2.5-VL config by flattening nested text_config."""
+        config = {
+            "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+            "hidden_size": 1111,
+            "num_hidden_layers": 11,
+            "num_attention_heads": 11,
+            "num_key_value_heads": 1,
+            "intermediate_size": 2222,
+            "vocab_size": 3333,
+            "max_position_embeddings": 4444,
+            "text_config": {
+                "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+                "num_hidden_layers": 64,
+                "num_key_value_heads": 8,
+                "hidden_size": 5120,
+                "num_attention_heads": 40,
+                "head_dim": 128,
+                "intermediate_size": 27648,
+                "vocab_size": 152064,
+                "max_position_embeddings": 128000,
+                "quantization_config": {"dummy": True},
+            },
+        }
+
+        result = _parse_hf_config_json(config)
+
+        assert result["architecture"] == "Qwen2_5_VLForConditionalGeneration"
+        assert result["layers"] == 64
+        assert result["n"] == 40
+        assert result["n_kv"] == 8
+        assert result["d"] == 128
+        assert result["hidden_size"] == 5120
+        assert result["inter_size"] == 27648
+        assert result["vocab"] == 152064
+        assert result["context"] == 128000
+
     def test_parse_nemotronh_config(self):
         """Test parsing a NemotronH hybrid model config (Mamba + MoE + Transformer)."""
         config = {
