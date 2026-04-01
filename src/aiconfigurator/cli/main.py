@@ -490,6 +490,19 @@ def configure_parser(parser):
     )
     _add_estimate_mode_arguments(estimate_parser)
 
+    # Profile mode - alias of estimate mode for CLI ergonomics
+    profile_parser = subparsers.add_parser(
+        "profile",
+        parents=[common_cli_parser],
+        help="Alias of 'estimate' for single-point TTFT/TPOT/power profiling.",
+        description=(
+            "Alias of 'estimate'. Run a single-point performance estimation to predict "
+            "TTFT (time to first token), TPOT (time per output token), and power "
+            "consumption for a given model, system, and configuration."
+        ),
+    )
+    _add_estimate_mode_arguments(profile_parser)
+
     # Support mode - support matrix check
     support_parser = subparsers.add_parser(
         "support",
@@ -1400,8 +1413,8 @@ def main(args):
         _run_generate_mode(args)
         return
 
-    # Handle estimate mode separately (single-point estimation)
-    if args.mode == "estimate":
+    # Handle estimate/profile modes separately (single-point estimation)
+    if args.mode in ("estimate", "profile"):
         _run_estimate_mode(args)
         return
 

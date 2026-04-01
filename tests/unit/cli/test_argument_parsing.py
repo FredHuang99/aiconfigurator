@@ -48,7 +48,7 @@ class TestCLIArgumentParsing:
     def test_mode_choices(self, cli_parser):
         """Ensure supported CLI modes are exposed."""
         action = next(action for action in cli_parser._actions if action.dest == "mode")
-        assert set(action.choices.keys()) == {"default", "exp", "generate", "support", "estimate"}
+        assert set(action.choices.keys()) == {"default", "exp", "generate", "support", "estimate", "profile"}
 
     def test_generate_mode_required_args(self, cli_parser):
         """Test that generate mode requires the correct arguments."""
@@ -80,6 +80,13 @@ class TestCLIArgumentParsing:
             ["generate", "--model-path", "Qwen/Qwen3-8B", "--total-gpus", "8", "--system", "h200_sxm"]
         )
         assert args.model_path == "Qwen/Qwen3-8B"
+
+    def test_profile_mode_parses_like_estimate(self, cli_parser):
+        """Profile mode should parse estimate arguments (alias behavior)."""
+        args = cli_parser.parse_args(["profile", "--model-path", "Qwen/Qwen3-32B", "--system", "h200_sxm"])
+        assert args.mode == "profile"
+        assert args.estimate_mode == "agg"
+        assert args.backend == common.BackendName.trtllm.value
 
     def test_backend_choices_validation(self, cli_parser):
         """Test that backend argument validates against supported choices."""
