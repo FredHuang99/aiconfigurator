@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,9 @@ class PEHardwareProfile:
     tpot_ms: dict[int, dict[int, dict[int, float]]]
     memory: MemoryProfile
     source_note: str
+    sim_ttft_ms: dict[int, dict[int, dict[int, float]]] | None = None
+    sim_tpot_ms: dict[int, dict[int, dict[int, float]]] | None = None
+    init_time_s: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,7 @@ class GeneratorModelProfile:
     encoder: dict[str, StageHardwareProfile]
     dit: dict[str, StageHardwareProfile]
     vae: dict[str, StageHardwareProfile]
+    init_time_s: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,7 @@ def _generator_hardware_profiles(
 
 
 def build_default_profile_data() -> TDProfileData:
+    pe7b_init_time_s = {8: 20.982828, 4: 19.974589, 2: 20.963828, 1: 19.95004}
     pe7b_a800_memory = MemoryProfile(
         {
             "weights": {1: 13.99, 2: 7.01, 4: 3.51, 8: 1.76},
@@ -94,6 +99,60 @@ def build_default_profile_data() -> TDProfileData:
             "others": {1: 0.99, 2: 1.04, 4: 2.56, 8: 2.59},
         }
     )
+    pe7b_a800_simu_ttft = {
+        128: {
+            512: {1: 25.999, 2: 15.743, 4: 10.718, 8: 8.348},
+            2048: {1: 25.999, 2: 15.743, 4: 10.718, 8: 8.348},
+        },
+        256: {
+            256: {1: 38.174, 2: 22.974, 4: 18.546, 8: 11.868},
+            1920: {1: 38.174, 2: 22.974, 4: 18.546, 8: 11.868},
+        },
+        384: {
+            128: {1: 52.593, 2: 30.118, 4: 22.154, 8: 19.118},
+            1792: {1: 52.593, 2: 30.118, 4: 22.154, 8: 19.118},
+        },
+        512: {1664: {1: 67.7, 2: 38.885, 4: 28.39, 8: 18.214}},
+        640: {1536: {1: 81.153, 2: 46.833, 4: 31.232, 8: 20.766}},
+        768: {1408: {1: 94.462, 2: 54.669, 4: 34.093, 8: 23.306}},
+        896: {1280: {1: 110.681, 2: 63.625, 4: 41.49, 8: 26.915}},
+        1024: {1152: {1: 126.853, 2: 72.543, 4: 48.894, 8: 30.521}},
+        1152: {1024: {1: 142.843, 2: 81.277, 4: 53.449, 8: 33.888}},
+        1280: {896: {1: 158.662, 2: 89.91, 4: 57.931, 8: 37.21}},
+        1408: {768: {1: 174.365, 2: 98.475, 4: 62.364, 8: 40.502}},
+        1536: {640: {1: 190.011, 2: 107.006, 4: 66.773, 8: 43.78}},
+        1664: {512: {1: 206.242, 2: 116.236, 4: 71.664, 8: 47.127}},
+        1792: {384: {1: 222.232, 2: 125.338, 4: 76.455, 8: 50.453}},
+        1920: {256: {1: 238.062, 2: 134.353, 4: 81.178, 8: 53.765}},
+        2048: {128: {1: 253.812, 2: 143.326, 4: 85.868, 8: 57.069}},
+    }
+    pe7b_a800_simu_tpot = {
+        128: {
+            512: {1: 11.334, 2: 6.58, 4: 4.09, 8: 2.823},
+            2048: {1: 11.501, 2: 6.731, 4: 4.243, 8: 2.984},
+        },
+        256: {
+            256: {1: 11.334, 2: 6.58, 4: 4.09, 8: 2.823},
+            1920: {1: 11.503, 2: 6.733, 4: 4.243, 8: 2.985},
+        },
+        384: {
+            128: {1: 11.343, 2: 6.585, 4: 4.095, 8: 2.843},
+            1792: {1: 11.505, 2: 6.736, 4: 4.244, 8: 2.986},
+        },
+        512: {1664: {1: 11.506, 2: 6.738, 4: 4.245, 8: 2.987}},
+        640: {1536: {1: 11.508, 2: 6.74, 4: 4.245, 8: 2.987}},
+        768: {1408: {1: 11.51, 2: 6.742, 4: 4.246, 8: 2.988}},
+        896: {1280: {1: 11.512, 2: 6.744, 4: 4.246, 8: 2.989}},
+        1024: {1152: {1: 11.513, 2: 6.746, 4: 4.247, 8: 2.99}},
+        1152: {1024: {1: 11.515, 2: 6.749, 4: 4.248, 8: 2.99}},
+        1280: {896: {1: 11.517, 2: 6.751, 4: 4.248, 8: 2.991}},
+        1408: {768: {1: 11.519, 2: 6.753, 4: 4.249, 8: 2.992}},
+        1536: {640: {1: 11.52, 2: 6.755, 4: 4.25, 8: 2.993}},
+        1664: {512: {1: 11.522, 2: 6.757, 4: 4.25, 8: 2.994}},
+        1792: {384: {1: 11.524, 2: 6.759, 4: 4.251, 8: 2.994}},
+        1920: {256: {1: 11.526, 2: 6.762, 4: 4.252, 8: 2.995}},
+        2048: {128: {1: 11.534, 2: 6.762, 4: 4.253, 8: 2.995}},
+    }
     pe7b_h100_latency_ttft = {
         128: {
             512: {1: 12.965, 2: 8.275, 4: 6.561, 8: 6.087},
@@ -167,6 +226,9 @@ def build_default_profile_data() -> TDProfileData:
                 },
                 memory=pe7b_a800_memory,
                 source_note="PE7B A800 NVLink latency and memory",
+                sim_ttft_ms=pe7b_a800_simu_ttft,
+                sim_tpot_ms=pe7b_a800_simu_tpot,
+                init_time_s=pe7b_init_time_s,
             ),
             "A100": PEHardwareProfile(
                 ttft_ms={
@@ -189,12 +251,16 @@ def build_default_profile_data() -> TDProfileData:
                     }
                 ),
                 source_note="PE7B A100 NVLink latency; A800 memory reused for TP8",
+                init_time_s=pe7b_init_time_s,
             ),
             "H100": PEHardwareProfile(
                 ttft_ms=pe7b_h100_latency_ttft,
                 tpot_ms=pe7b_h100_latency_tpot,
                 memory=pe7b_a800_memory,
                 source_note="PE7B H100 NVLink simulated latency; A800 memory",
+                sim_ttft_ms=pe7b_h100_latency_ttft,
+                sim_tpot_ms=pe7b_h100_latency_tpot,
+                init_time_s=pe7b_init_time_s,
             ),
         },
     )
@@ -234,6 +300,7 @@ def build_default_profile_data() -> TDProfileData:
             },
             "WAN2.2 VAE",
         ),
+        init_time_s={1: 24.447095, 2: 28.080947, 4: 40.251256, 8: 61.020383},
     )
 
     wan21_encoder_memory = MemoryProfile(
