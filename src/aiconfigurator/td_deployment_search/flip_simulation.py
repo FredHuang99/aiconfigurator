@@ -10,7 +10,7 @@ import json
 import math
 import statistics
 from collections import Counter, deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Deque, Iterable
@@ -31,6 +31,12 @@ TEMPLATE_DIT_VAE_COMB = "DiT_VAE_Comb"
 
 MODE_NO_FLIP = "no_flip"
 MODE_CAN_FLIP = "can_flip"
+MARGIN_MODE_HYSTERESIS = "hysteresis"
+MARGIN_MODE_SINGLE = "single"
+COLD_START_MODE_PROFILE = "profile"
+COLD_START_MODE_ZERO = "zero"
+PE_OUTPUT_ESTIMATE_MODE_MONITOR = "monitor"
+PE_OUTPUT_ESTIMATE_MODE_ORACLE = "oracle"
 EPS = 1e-9
 
 DEFAULT_DOMINANT_INTERVALS_CSV = Path(
@@ -39,6 +45,12 @@ DEFAULT_DOMINANT_INTERVALS_CSV = Path(
 )
 DEFAULT_OUTPUT_DIR = Path("td_outputs") / "flip_simulation"
 DEFAULT_TRACE_START = "2024-10-15T12:00:00+00:00"
+
+
+def margin_label(ratio: float) -> str:
+    if abs(ratio) <= EPS:
+        return "non_margin"
+    return f"margin_{ratio:.2f}".replace(".", "p")
 
 
 @dataclass(frozen=True)
@@ -60,6 +72,9 @@ class SimulationConfig:
     monitor_windows_sec: tuple[float, ...] = (10.0, 20.0, 30.0, 60.0)
     duration_min: float = 60.0
     token_threshold: float = 1280.0
+    threshold_margin_ratio: float = 0.0
+    threshold_margin_mode: str = MARGIN_MODE_HYSTERESIS
+    compare_threshold_margin_ratios: tuple[float, ...] = ()
     seed: int = 0
     mode: str = "both"
     pe_model: str = "pe7b"
@@ -72,6 +87,8 @@ class SimulationConfig:
     deployment_preset: str = "wan22_group1_fragment"
     flip_plan_preset: str = "wan22_group1_restricted"
     flip_source_count: int = 2
+    cold_start_mode: str = COLD_START_MODE_PROFILE
+    pe_output_estimate_mode: str = PE_OUTPUT_ESTIMATE_MODE_MONITOR
     trace_start: str = DEFAULT_TRACE_START
     verbose: bool = False
 
@@ -250,6 +267,12 @@ class FlipEvent:
     detect_time_s: float
     avg_output_tokens: float
     window_count: int
+    threshold_mid: float
+    threshold_low: float
+    threshold_high: float
+    margin_ratio: float
+    margin_label: str
+    monitor_decision: str
     trace_change_time_s: float | None
     detection_delay_s: float | None
     selected_bundle_keys: list[str]
@@ -260,6 +283,43 @@ class FlipEvent:
     cold_start_time_s: float | None = None
     cold_start_done_time_s: float | None = None
     launch_target_instance_ids: list[str] = field(default_factory=list)
+    selection_restart_ready_delay_s: float = 0.0
+    selection_complement_added_work_s: float = 0.0
+    selection_running_added_work_s: float = 0.0
+    selection_waiting_added_work_s: float = 0.0
+    selection_pe_bin_tokens: str = ""
+    selection_migrated_request_count: int = 0
+    selection_template_penalty: int = 0
+    selection_round_robin_rank: int = 0
+
+
+@dataclass(frozen=True)
+class FlipSelectionScore:
+    restart_ready_delay_s: float
+    complement_added_work_s: float
+    running_added_work_s: float
+    waiting_added_work_s: float
+    pe_bin_tokens: str
+    migrated_request_count: int
+    template_penalty: int
+    round_robin_rank: int
+    bundle_order_key: tuple[int, ...] = ()
+
+    def sort_key(self) -> tuple[float, float, int, int, tuple[int, ...]]:
+        return (
+            self.restart_ready_delay_s,
+            self.complement_added_work_s,
+            self.migrated_request_count,
+            self.template_penalty,
+            self.round_robin_rank,
+            self.bundle_order_key,
+        )
+
+
+@dataclass(frozen=True)
+class FlipSelection:
+    bundles: tuple[BundleState, ...]
+    score: FlipSelectionScore
 
 
 @dataclass
@@ -390,20 +450,36 @@ class FlipSimulator:
         self.request_rate_per_min = request_rate_per_min
         self.monitor_window_sec = monitor_window_sec
         self.mode = mode
-        self.run_id = f"rate{request_rate_per_min:g}_window{monitor_window_sec:g}_{mode}"
+        run_suffix_parts = [margin_label(config.threshold_margin_ratio)]
+        if config.cold_start_mode != COLD_START_MODE_PROFILE:
+            run_suffix_parts.append(f"cold_{config.cold_start_mode}")
+        if config.pe_output_estimate_mode != PE_OUTPUT_ESTIMATE_MODE_MONITOR:
+            run_suffix_parts.append(f"pe_est_{config.pe_output_estimate_mode}")
+        self.run_id = (
+            f"rate{request_rate_per_min:g}_window{monitor_window_sec:g}_{mode}_"
+            f"{'_'.join(run_suffix_parts)}"
+        )
 
         self.event_q: list[tuple[float, int, int, str, dict[str, object]]] = []
         self.event_counter = 0
         self.requests: list[Request] = []
         self.attempts: list[StageAttempt] = []
         self.attempt_counts: Counter[tuple[int, str]] = Counter()
-        self.pe_output_log: list[tuple[float, int, int]] = []
+        self.pe_output_log: list[tuple[float, int, int, str]] = []
+        self.pe_output_window: Deque[tuple[float, int, int, str]] = deque()
+        self.pe_window_tokens_by_instance: Counter[str] = Counter()
+        self.pe_window_counts_by_instance: Counter[str] = Counter()
+        self.pe_window_total_tokens = 0
+        self.pe_window_total_count = 0
+        self.pe_window_loaded_index = 0
+        self.pe_window_now_s = float("-inf")
         self.flip_events: list[FlipEvent] = []
         self.stage_instances: dict[str, list[StageInstance]] = {stage: [] for stage in STAGE_SEQUENCE}
         self.bundles: dict[str, BundleState] = {}
         self.converted_bundle_keys: list[str] = []
         self.current_target = "short"
         self.launching_direction: str | None = None
+        self.flip_round_robin_cursor = 0
         self.next_order = 0
 
         self._build_deployment()
@@ -665,7 +741,7 @@ class FlipSimulator:
             attempt.exit_reason = "completed"
         if stage == STAGE_PE:
             req.pe_generated_tokens = req.output_tokens
-            self.pe_output_log.append((now_s, req.output_tokens, req.req_id))
+            self.pe_output_log.append((now_s, req.output_tokens, req.req_id, inst.instance_id))
         elif stage == STAGE_DIT:
             req.dit_completed_steps = self.config.denoising_steps
 
@@ -684,7 +760,7 @@ class FlipSimulator:
             self.dispatch_to_stage(req, next_stage, now_s)
 
     def dispatch_to_stage(self, req: Request, stage: str, now_s: float) -> None:
-        inst = self.choose_least_waiting(stage)
+        inst = self.choose_least_waiting(stage, incoming_req=req, now_s=now_s)
         self.enqueue_request(req, inst, now_s, queue_insert="tail", at_head=False)
         self.start_next_if_possible(inst, now_s)
 
@@ -754,6 +830,66 @@ class FlipSimulator:
         if inst.stage == STAGE_VAE:
             return StageRun(total_duration_s=inst.base_latency_s)
         raise ValueError(f"Unsupported stage: {inst.stage}")
+
+    def estimate_stage_service_time_s(self, req: Request, inst: StageInstance, now_s: float = 0.0) -> float:
+        if inst.stage == STAGE_PE:
+            return self.estimate_pe_service_time_s(req, inst, req.pe_generated_tokens, now_s)
+        if inst.stage == STAGE_ENCODER:
+            return max(inst.base_latency_s, EPS)
+        if inst.stage == STAGE_DIT:
+            return self.estimate_dit_service_time_s(req, inst, req.dit_completed_steps)
+        if inst.stage == STAGE_VAE:
+            return max(inst.base_latency_s, EPS)
+        raise ValueError(f"Unsupported stage: {inst.stage}")
+
+    def estimate_dit_service_time_s(
+        self,
+        req: Request,
+        inst: StageInstance,
+        completed_steps: int,
+    ) -> float:
+        _ = req
+        remaining_steps = max(0, self.config.denoising_steps - completed_steps)
+        step_s = inst.base_latency_s / self.config.denoising_steps
+        return max(remaining_steps * step_s, 0.0)
+
+    def estimate_pe_service_time_s(
+        self,
+        req: Request,
+        inst: StageInstance,
+        generated_tokens: int,
+        now_s: float = 0.0,
+    ) -> float:
+        output_tokens = self.pe_output_tokens_for_estimate(req, inst, now_s, generated_tokens)
+        return self.estimate_pe_service_time_for_output_s(req, inst, output_tokens, generated_tokens)
+
+    def pe_output_tokens_for_estimate(
+        self,
+        req: Request,
+        inst: StageInstance,
+        now_s: float,
+        generated_tokens: int = 0,
+    ) -> int:
+        if self.config.pe_output_estimate_mode == PE_OUTPUT_ESTIMATE_MODE_ORACLE:
+            return req.output_tokens
+        if self.config.pe_output_estimate_mode != PE_OUTPUT_ESTIMATE_MODE_MONITOR:
+            raise ValueError(f"Unsupported PE output estimate mode: {self.config.pe_output_estimate_mode}")
+        return self.pe_estimated_output_bin(inst, now_s, generated_tokens)
+
+    def estimate_pe_service_time_for_output_s(
+        self,
+        req: Request,
+        inst: StageInstance,
+        output_tokens: int,
+        generated_tokens: int,
+    ) -> float:
+        hardware = self.catalog.profile_data.pe_models[self.config.pe_model].hardware[inst.gpu_type]
+        generated = max(0, generated_tokens)
+        ttft_s = hardware.ttft_ms[req.input_tokens][output_tokens][inst.parallelism] / 1000.0
+        tpot_s = hardware.tpot_ms[req.input_tokens][output_tokens][inst.parallelism] / 1000.0
+        if generated <= 0:
+            return max(ttft_s + max(0, output_tokens - 1) * tpot_s, EPS)
+        return max(max(0, output_tokens - generated) * tpot_s, 0.0)
 
     def build_pe_execution(self, req: Request, inst: StageInstance, attempt: StageAttempt) -> PEExecution:
         hardware = self.catalog.profile_data.pe_models[self.config.pe_model].hardware[inst.gpu_type]
@@ -828,48 +964,249 @@ class FlipSimulator:
         self,
         stage: str,
         candidates: Iterable[StageInstance] | None = None,
-        estimated_counts: dict[str, int] | None = None,
+        estimated_scores: dict[str, float] | None = None,
+        incoming_req: Request | None = None,
+        now_s: float = 0.0,
     ) -> StageInstance:
         pool = list(candidates) if candidates is not None else self.stage_instances[stage]
         ready = [inst for inst in pool if inst.active_ready()]
         if not ready:
             raise RuntimeError(f"No active ready instances for stage {stage}")
-        if estimated_counts is None:
-            estimated_counts = {inst.instance_id: inst.load_count() for inst in ready}
-        return min(ready, key=lambda inst: (estimated_counts[inst.instance_id], inst.order))
+        if estimated_scores is None:
+            estimated_scores = self.estimated_work_scores(ready, now_s)
+
+        def candidate_score(inst: StageInstance) -> float:
+            score = estimated_scores[inst.instance_id]
+            if incoming_req is not None:
+                score += self.estimate_stage_service_time_s(incoming_req, inst, now_s)
+            return score
+
+        return min(ready, key=lambda inst: (candidate_score(inst), inst.order))
+
+    def estimated_work_scores(self, candidates: Iterable[StageInstance], now_s: float) -> dict[str, float]:
+        return {inst.instance_id: self.instance_remaining_work_s(inst, now_s) for inst in candidates}
+
+    def incoming_load_increment(
+        self,
+        candidates: Iterable[StageInstance],
+        inst: StageInstance,
+        req: Request,
+        now_s: float = 0.0,
+    ) -> float:
+        _ = candidates
+        return self.estimate_stage_service_time_s(req, inst, now_s)
+
+    def estimated_load_scores(self, candidates: Iterable[StageInstance]) -> dict[str, float]:
+        return self.estimated_work_scores(candidates, 0.0)
+
+    def instance_remaining_work_s(self, inst: StageInstance, now_s: float) -> float:
+        total = self.running_remaining_work_s(inst, now_s)
+        for req_id, _attempt_id in inst.queue:
+            total += self.estimate_stage_service_time_s(self.requests[req_id], inst, now_s)
+        return total
+
+    def running_remaining_work_s(self, inst: StageInstance, now_s: float) -> float:
+        if inst.current_run is None or inst.current_start_time_s is None:
+            return 0.0
+        if inst.stage == STAGE_PE and inst.current_run.pe_execution is not None:
+            generated = inst.current_run.pe_execution.generated_after_elapsed(now_s - inst.current_start_time_s)
+            return self.estimate_pe_service_time_s(self.requests[inst.current_req_id], inst, generated, now_s)
+        return max(0.0, inst.current_start_time_s + inst.current_run.total_duration_s - now_s)
+
+    def pe_output_bins(self) -> list[int]:
+        return sorted({self.config.short_output_tokens, self.config.long_output_tokens})
+
+    def classify_output_bin(self, avg_output_tokens: float) -> int:
+        bins = self.pe_output_bins()
+        if len(bins) == 1:
+            return bins[0]
+        for lower, upper in zip(bins, bins[1:]):
+            midpoint = (lower + upper) / 2.0
+            if avg_output_tokens < midpoint:
+                return lower
+        return bins[-1]
+
+    def pe_monitor_samples(
+        self,
+        now_s: float,
+        *,
+        instance_id: str | None = None,
+    ) -> list[tuple[float, int, int, str]]:
+        self.refresh_pe_monitor_window(now_s)
+        if instance_id is None:
+            return list(self.pe_output_window)
+        return [sample for sample in self.pe_output_window if sample[3] == instance_id]
+
+    def refresh_pe_monitor_window(self, now_s: float) -> None:
+        if now_s + EPS < self.pe_window_now_s:
+            self.reset_pe_monitor_window()
+        lo = now_s - self.monitor_window_sec
+        while self.pe_window_loaded_index < len(self.pe_output_log):
+            sample = self.pe_output_log[self.pe_window_loaded_index]
+            if sample[0] > now_s + EPS:
+                break
+            if sample[0] > lo + EPS:
+                self.add_pe_window_sample(sample)
+            self.pe_window_loaded_index += 1
+        while self.pe_output_window and self.pe_output_window[0][0] <= lo + EPS:
+            self.remove_pe_window_sample(self.pe_output_window.popleft())
+        self.pe_window_now_s = now_s
+
+    def reset_pe_monitor_window(self) -> None:
+        self.pe_output_window.clear()
+        self.pe_window_tokens_by_instance.clear()
+        self.pe_window_counts_by_instance.clear()
+        self.pe_window_total_tokens = 0
+        self.pe_window_total_count = 0
+        self.pe_window_loaded_index = 0
+        self.pe_window_now_s = float("-inf")
+
+    def add_pe_window_sample(self, sample: tuple[float, int, int, str]) -> None:
+        _time_s, tokens, _req_id, instance_id = sample
+        self.pe_output_window.append(sample)
+        self.pe_window_tokens_by_instance[instance_id] += tokens
+        self.pe_window_counts_by_instance[instance_id] += 1
+        self.pe_window_total_tokens += tokens
+        self.pe_window_total_count += 1
+
+    def remove_pe_window_sample(self, sample: tuple[float, int, int, str]) -> None:
+        _time_s, tokens, _req_id, instance_id = sample
+        self.pe_window_tokens_by_instance[instance_id] -= tokens
+        self.pe_window_counts_by_instance[instance_id] -= 1
+        if self.pe_window_tokens_by_instance[instance_id] <= 0:
+            del self.pe_window_tokens_by_instance[instance_id]
+        if self.pe_window_counts_by_instance[instance_id] <= 0:
+            del self.pe_window_counts_by_instance[instance_id]
+        self.pe_window_total_tokens -= tokens
+        self.pe_window_total_count -= 1
+
+    def pe_monitor_avg_output_tokens(self, now_s: float, instance_id: str | None = None) -> float | None:
+        self.refresh_pe_monitor_window(now_s)
+        if instance_id is None:
+            count = self.pe_window_total_count
+            tokens = self.pe_window_total_tokens
+        else:
+            count = self.pe_window_counts_by_instance[instance_id]
+            tokens = self.pe_window_tokens_by_instance[instance_id]
+        if count <= 0:
+            return None
+        return tokens / count
+
+    def pe_estimated_output_bin(
+        self,
+        inst: StageInstance,
+        now_s: float,
+        generated_tokens: int = 0,
+    ) -> int:
+        avg_tokens = self.pe_monitor_avg_output_tokens(now_s, inst.instance_id)
+        if avg_tokens is None:
+            avg_tokens = self.pe_monitor_avg_output_tokens(now_s, None)
+        if avg_tokens is None:
+            estimated = self.config.long_output_tokens if self.current_target == "long" else self.config.short_output_tokens
+        else:
+            estimated = self.classify_output_bin(avg_tokens)
+        for output_tokens in self.pe_output_bins():
+            if generated_tokens <= output_tokens:
+                return max(estimated, output_tokens)
+        return self.pe_output_bins()[-1]
+
+    def pe_instance_tokens_per_s(self, inst: StageInstance, now_s: float) -> float:
+        self.refresh_pe_monitor_window(now_s)
+        instance_tokens = self.pe_window_tokens_by_instance[inst.instance_id]
+        if instance_tokens > 0:
+            return max(instance_tokens / self.monitor_window_sec, EPS)
+        if self.pe_window_total_count > 0:
+            sampled_instance_count = len(self.pe_window_counts_by_instance)
+            return max(
+                self.pe_window_total_tokens / self.monitor_window_sec / max(1, sampled_instance_count),
+                EPS,
+            )
+        output_tokens = self.pe_estimated_output_bin(inst, now_s)
+        profile_s = self.estimate_pe_service_time_for_output_s(
+            Request(-1, 0.0, self.config.input_tokens, output_tokens, "Estimate", 0.0, 0.0),
+            inst,
+            output_tokens,
+            0,
+        )
+        return max(output_tokens / profile_s, EPS)
+
+    def pe_remaining_tokens_for_work(self, inst: StageInstance, now_s: float) -> int:
+        if inst.current_req_id is None or inst.current_run is None or inst.current_run.pe_execution is None:
+            return 0
+        req = self.requests[inst.current_req_id]
+        generated = inst.current_run.pe_execution.generated_after_elapsed(now_s - inst.current_start_time_s)
+        output_tokens = self.pe_output_tokens_for_estimate(req, inst, now_s, generated)
+        return max(0, output_tokens - generated)
+
+    def pe_waiting_tokens_for_work(self, inst: StageInstance, now_s: float) -> int:
+        if self.config.pe_output_estimate_mode == PE_OUTPUT_ESTIMATE_MODE_ORACLE:
+            return sum(self.requests[req_id].output_tokens for req_id, _attempt_id in inst.queue)
+        output_tokens = self.pe_estimated_output_bin(inst, now_s)
+        return len(inst.queue) * output_tokens
 
     def handle_monitor(self, now_s: float) -> None:
         if self.mode != MODE_CAN_FLIP:
             return
-        lo = now_s - self.monitor_window_sec
-        vals = [tokens for time_s, tokens, _req_id in self.pe_output_log if lo < time_s <= now_s + EPS]
-        if vals:
-            avg_tokens = sum(vals) / len(vals)
-            if avg_tokens > self.config.token_threshold:
-                self.begin_flip("short_to_long", now_s, avg_tokens, len(vals))
-            else:
-                self.begin_flip("long_to_short", now_s, avg_tokens, len(vals))
+        self.refresh_pe_monitor_window(now_s)
+        if self.pe_window_total_count:
+            avg_tokens = self.pe_window_total_tokens / self.pe_window_total_count
+            decision = self.monitor_decision(avg_tokens)
+            if decision in {"short_to_long", "long_to_short"}:
+                self.begin_flip(decision, now_s, avg_tokens, self.pe_window_total_count, decision)
         if any(req.finish_time_s is None for req in self.requests):
             self.schedule_event(now_s + self.monitor_window_sec, 3, "monitor", {})
 
-    def begin_flip(self, direction: str, now_s: float, avg_tokens: float, window_count: int) -> None:
+    def threshold_bounds(self) -> tuple[float, float, float]:
+        mid = self.config.token_threshold
+        token_range = self.config.long_output_tokens - self.config.short_output_tokens
+        delta = self.config.threshold_margin_ratio * token_range
+        if self.config.threshold_margin_ratio <= 0:
+            return mid, mid, mid
+        return mid, mid - delta, mid + delta
+
+    def monitor_decision(self, avg_tokens: float) -> str:
+        mid, low, high = self.threshold_bounds()
+        if self.config.threshold_margin_ratio <= 0:
+            return "short_to_long" if avg_tokens > mid else "long_to_short"
+        if self.config.threshold_margin_mode == MARGIN_MODE_SINGLE:
+            return "short_to_long" if avg_tokens > high else "long_to_short"
+        if self.config.threshold_margin_mode != MARGIN_MODE_HYSTERESIS:
+            raise ValueError(f"Unsupported threshold margin mode: {self.config.threshold_margin_mode}")
+        if self.current_target == "short" and avg_tokens > high:
+            return "short_to_long"
+        if self.current_target == "long" and avg_tokens < low:
+            return "long_to_short"
+        return "deadband_keep_current"
+
+    def begin_flip(
+        self,
+        direction: str,
+        now_s: float,
+        avg_tokens: float,
+        window_count: int,
+        monitor_decision: str,
+    ) -> None:
         if self.launching_direction is not None:
             return
         if direction == "short_to_long":
             if self.current_target == "long":
                 return
-            selected_bundles = self.select_bundles_for_flip()
+            selection = self.select_bundles_for_flip(now_s)
+            selected_bundles = list(selection.bundles)
+            selection_score = selection.score
             target = "long"
         elif direction == "long_to_short":
             if self.current_target == "short":
                 return
             selected_bundles = [self.bundles[key] for key in self.converted_bundle_keys]
+            selection_score = self.score_flip_bundle_combination(selected_bundles, direction, now_s)
             target = "short"
         else:
             raise ValueError(direction)
         if not selected_bundles:
             return
 
+        threshold_mid, threshold_low, threshold_high = self.threshold_bounds()
         trace_change = self.find_trace_change_time(direction, now_s)
         flip = FlipEvent(
             flip_id=len(self.flip_events),
@@ -880,10 +1217,24 @@ class FlipSimulator:
             detect_time_s=now_s,
             avg_output_tokens=avg_tokens,
             window_count=window_count,
+            threshold_mid=threshold_mid,
+            threshold_low=threshold_low,
+            threshold_high=threshold_high,
+            margin_ratio=self.config.threshold_margin_ratio,
+            margin_label=margin_label(self.config.threshold_margin_ratio),
+            monitor_decision=monitor_decision,
             trace_change_time_s=trace_change,
             detection_delay_s=(now_s - trace_change) if trace_change is not None else None,
             selected_bundle_keys=[bundle.bundle_key for bundle in selected_bundles],
             selected_instance_ids=[],
+            selection_restart_ready_delay_s=selection_score.restart_ready_delay_s,
+            selection_complement_added_work_s=selection_score.complement_added_work_s,
+            selection_running_added_work_s=selection_score.running_added_work_s,
+            selection_waiting_added_work_s=selection_score.waiting_added_work_s,
+            selection_pe_bin_tokens=selection_score.pe_bin_tokens,
+            selection_migrated_request_count=selection_score.migrated_request_count,
+            selection_template_penalty=selection_score.template_penalty,
+            selection_round_robin_rank=selection_score.round_robin_rank,
         )
         self.flip_events.append(flip)
         self.launching_direction = direction
@@ -897,7 +1248,7 @@ class FlipSimulator:
         flip.drain_done_time_s = drain_done
         self.schedule_event(drain_done, 2, "cold_start_begin", {"flip_id": flip.flip_id})
 
-    def select_bundles_for_flip(self) -> list[BundleState]:
+    def select_bundles_for_flip(self, now_s: float = 0.0) -> FlipSelection:
         candidates = [
             bundle
             for bundle in self.bundles.values()
@@ -908,19 +1259,269 @@ class FlipSimulator:
             and bundle.bundle_size == 8
             and bundle.template_name in {TEMPLATE_DIT_ONLY, TEMPLATE_VAE_ONLY, TEMPLATE_DIT_VAE_COMB}
         ]
-        candidates.sort(
-            key=lambda bundle: (
-                1 if bundle.template_name == TEMPLATE_DIT_VAE_COMB else 0,
-                1 if bundle.has_running() else 0,
-                bundle.waiting_count(),
-                bundle.order,
-            )
-        )
         if len(candidates) < self.config.flip_source_count:
             raise RuntimeError(
                 f"Need {self.config.flip_source_count} flip sources but only found {len(candidates)} candidates"
             )
-        return candidates[: self.config.flip_source_count]
+        selected = self.greedy_select_flip_bundles(candidates, "short_to_long", now_s)
+        self.flip_round_robin_cursor = (self.flip_round_robin_cursor + self.config.flip_source_count) % len(candidates)
+        return FlipSelection(
+            bundles=tuple(sorted(selected, key=lambda bundle: bundle.order)),
+            score=self.score_flip_bundle_combination(selected, "short_to_long", now_s),
+        )
+
+    def greedy_select_flip_bundles(
+        self,
+        candidates: list[BundleState],
+        direction: str,
+        now_s: float,
+    ) -> list[BundleState]:
+        count = self.config.flip_source_count
+        ordered = sorted(
+            candidates,
+            key=lambda bundle: (self.restart_ready_delay_s([bundle], direction, now_s), bundle.order),
+        )
+        if len(ordered) <= count:
+            return ordered
+        cutoff = self.restart_ready_delay_s([ordered[count - 1]], direction, now_s)
+        selected = [
+            bundle for bundle in ordered if self.restart_ready_delay_s([bundle], direction, now_s) < cutoff - EPS
+        ]
+        tie_set = [
+            bundle for bundle in ordered if abs(self.restart_ready_delay_s([bundle], direction, now_s) - cutoff) <= EPS
+        ]
+        needed = count - len(selected)
+        if needed >= len(tie_set):
+            return selected + tie_set
+
+        complement_sorted = sorted(
+            tie_set,
+            key=lambda bundle: (
+                self.complement_added_work_score([bundle], direction, now_s).complement_added_work_s,
+                bundle.order,
+            ),
+        )
+        cutoff_work = self.complement_added_work_score(
+            [complement_sorted[needed - 1]],
+            direction,
+            now_s,
+        ).complement_added_work_s
+        selected_work = [
+            bundle
+            for bundle in complement_sorted
+            if self.complement_added_work_score([bundle], direction, now_s).complement_added_work_s
+            < cutoff_work - EPS
+        ]
+        work_tie = [
+            bundle
+            for bundle in complement_sorted
+            if abs(
+                self.complement_added_work_score([bundle], direction, now_s).complement_added_work_s - cutoff_work
+            )
+            <= EPS
+        ]
+        remaining = needed - len(selected_work)
+        if remaining >= len(work_tie):
+            return selected + selected_work + work_tie
+
+        candidates_by_template = sorted(
+            work_tie,
+            key=lambda bundle: (
+                self.template_penalty(bundle),
+                self.round_robin_rank(bundle, candidates),
+                bundle.order,
+            ),
+        )
+        return selected + selected_work + candidates_by_template[:remaining]
+
+    def score_flip_bundle_combination(
+        self,
+        bundles: Iterable[BundleState],
+        direction: str,
+        now_s: float,
+    ) -> FlipSelectionScore:
+        selected_bundles = tuple(sorted(bundles, key=lambda bundle: bundle.order))
+        complement_score = self.complement_added_work_score(selected_bundles, direction, now_s)
+        return FlipSelectionScore(
+            restart_ready_delay_s=self.restart_ready_delay_s(selected_bundles, direction, now_s),
+            complement_added_work_s=complement_score.complement_added_work_s,
+            running_added_work_s=complement_score.running_added_work_s,
+            waiting_added_work_s=complement_score.waiting_added_work_s,
+            pe_bin_tokens=complement_score.pe_bin_tokens,
+            migrated_request_count=complement_score.migrated_request_count,
+            template_penalty=sum(self.template_penalty(bundle) for bundle in selected_bundles),
+            round_robin_rank=sum(
+                self.round_robin_rank(bundle, list(selected_bundles)) for bundle in selected_bundles
+            ),
+            bundle_order_key=tuple(bundle.order for bundle in selected_bundles),
+        )
+
+    def restart_ready_delay_s(
+        self,
+        bundles: Iterable[BundleState],
+        direction: str,
+        now_s: float,
+    ) -> float:
+        boundary_delay = 0.0
+        for source in self.flip_source_instances(bundles, direction):
+            boundary_time = self.current_boundary_time(source, now_s, finish_vae=direction == "short_to_long")
+            boundary_delay = max(boundary_delay, max(0.0, boundary_time - now_s))
+        cold_start_s = self.flip_cold_start_s(direction)
+        return boundary_delay + cold_start_s
+
+    def flip_cold_start_s(self, direction: str) -> float:
+        if self.config.cold_start_mode == COLD_START_MODE_ZERO:
+            return 0.0
+        if self.config.cold_start_mode != COLD_START_MODE_PROFILE:
+            raise ValueError(f"Unsupported cold start mode: {self.config.cold_start_mode}")
+        if direction == "short_to_long":
+            return self.pe_init_time_s("A800", 2)
+        if direction == "long_to_short":
+            return self.generator_init_time_s(8)
+        raise ValueError(direction)
+
+    def complement_added_work_score(
+        self,
+        bundles: Iterable[BundleState],
+        direction: str,
+        now_s: float,
+    ) -> FlipSelectionScore:
+        selected_bundles = tuple(sorted(bundles, key=lambda bundle: bundle.order))
+        stage_running: Counter[str] = Counter()
+        stage_waiting: Counter[str] = Counter()
+        migrated_request_count = 0
+        pe_bin_tags: list[str] = []
+
+        for source in self.flip_source_instances(selected_bundles, direction):
+            if source.stage == STAGE_PE:
+                running_tokens = self.pe_remaining_tokens_for_work(source, now_s)
+                waiting_tokens = self.pe_waiting_tokens_for_work(source, now_s)
+                stage_running[STAGE_PE] += running_tokens
+                stage_waiting[STAGE_PE] += waiting_tokens
+                pe_bin_tags.append(f"{source.instance_id}:{self.pe_estimated_output_bin(source, now_s)}")
+                migrated_request_count += len(source.queue) + (1 if running_tokens > 0 else 0)
+            elif source.stage == STAGE_DIT:
+                running_units = self.dit_running_units_for_work(source, now_s)
+                stage_running[STAGE_DIT] += running_units
+                stage_waiting[STAGE_DIT] += len(source.queue)
+                migrated_request_count += len(source.queue) + (1 if running_units > 0 else 0)
+            elif source.stage == STAGE_VAE:
+                running_units = self.vae_running_units_for_work(source, now_s)
+                stage_running[STAGE_VAE] += running_units
+                stage_waiting[STAGE_VAE] += len(source.queue)
+                migrated_request_count += len(source.queue) + (1 if running_units > 0 else 0)
+
+        selected_ids = {inst.instance_id for inst in self.flip_source_instances(selected_bundles, direction)}
+        stage_totals: dict[str, tuple[float, float]] = {}
+        for stage in (STAGE_PE, STAGE_DIT, STAGE_VAE):
+            running_s = self.stage_work_units_to_seconds(stage, stage_running[stage], selected_ids, now_s)
+            waiting_s = self.stage_work_units_to_seconds(stage, stage_waiting[stage], selected_ids, now_s)
+            if running_s or waiting_s:
+                stage_totals[stage] = (running_s, waiting_s)
+
+        if STAGE_DIT in stage_totals and STAGE_VAE in stage_totals:
+            complement_added = max(sum(stage_totals[STAGE_DIT]), sum(stage_totals[STAGE_VAE]))
+        else:
+            complement_added = sum(running_s + waiting_s for running_s, waiting_s in stage_totals.values())
+        return FlipSelectionScore(
+            restart_ready_delay_s=0.0,
+            complement_added_work_s=complement_added,
+            running_added_work_s=sum(running_s for running_s, _waiting_s in stage_totals.values()),
+            waiting_added_work_s=sum(waiting_s for _running_s, waiting_s in stage_totals.values()),
+            pe_bin_tokens=";".join(pe_bin_tags),
+            migrated_request_count=migrated_request_count,
+            template_penalty=sum(self.template_penalty(bundle) for bundle in selected_bundles),
+            round_robin_rank=0,
+        )
+
+    def stage_work_units_to_seconds(
+        self,
+        stage: str,
+        units: float,
+        selected_ids: set[str],
+        now_s: float,
+    ) -> float:
+        if units <= 0:
+            return 0.0
+        if stage == STAGE_PE:
+            throughput = sum(
+                self.pe_instance_tokens_per_s(inst, now_s)
+                for inst in self.stage_instances[STAGE_PE]
+                if inst.instance_id not in selected_ids and inst.active_ready()
+            )
+        else:
+            throughput = sum(
+                1.0 / max(inst.base_latency_s, EPS)
+                for inst in self.stage_instances[stage]
+                if inst.instance_id not in selected_ids and inst.active_ready()
+            )
+        if throughput <= 0:
+            return float("inf")
+        return units / throughput
+
+    def dit_running_units_for_work(self, inst: StageInstance, now_s: float) -> float:
+        if inst.current_req_id is None or inst.current_run is None or inst.current_start_time_s is None:
+            return 0.0
+        boundary_time = self.current_boundary_time(inst, now_s, finish_vae=False)
+        elapsed = max(0.0, boundary_time - inst.current_start_time_s)
+        completed = inst.current_run.dit_completed_after_elapsed(elapsed, self.config.denoising_steps)
+        return max(0, self.config.denoising_steps - completed) / self.config.denoising_steps
+
+    def vae_running_units_for_work(self, inst: StageInstance, now_s: float) -> float:
+        if inst.current_req_id is None or inst.current_run is None or inst.current_start_time_s is None:
+            return 0.0
+        remaining_s = max(0.0, inst.current_start_time_s + inst.current_run.total_duration_s - now_s)
+        return remaining_s / max(inst.base_latency_s, EPS)
+
+    def template_penalty(self, bundle: BundleState) -> int:
+        return 1 if bundle.template_name == TEMPLATE_DIT_VAE_COMB else 0
+
+    def round_robin_rank(self, bundle: BundleState, candidates: list[BundleState]) -> int:
+        ordered = sorted(candidates, key=lambda candidate: candidate.order)
+        if not ordered:
+            return 0
+        index_by_key = {candidate.bundle_key: idx for idx, candidate in enumerate(ordered)}
+        return (index_by_key[bundle.bundle_key] - self.flip_round_robin_cursor) % len(ordered)
+
+    def flip_source_instances(
+        self,
+        bundles: Iterable[BundleState],
+        direction: str,
+    ) -> list[StageInstance]:
+        sources: list[StageInstance] = []
+        for bundle in bundles:
+            if direction == "short_to_long":
+                sources.extend(sorted(bundle.stage_instances.values(), key=lambda inst: inst.order))
+            elif direction == "long_to_short":
+                sources.extend(
+                    inst
+                    for inst in sorted(bundle.pe_target_instances, key=lambda candidate: candidate.order)
+                    if inst.active
+                )
+            else:
+                raise ValueError(direction)
+        return sources
+
+    def estimate_running_migration_service_time_s(
+        self,
+        source: StageInstance,
+        target: StageInstance,
+        boundary_time_s: float,
+    ) -> float:
+        if source.current_req_id is None or source.current_run is None or source.current_start_time_s is None:
+            return 0.0
+        req = self.requests[source.current_req_id]
+        elapsed_s = max(0.0, boundary_time_s - source.current_start_time_s)
+        if source.stage == STAGE_PE and source.current_run.pe_execution is not None:
+            generated = source.current_run.pe_execution.generated_after_elapsed(elapsed_s)
+            return self.estimate_pe_service_time_s(req, target, generated, boundary_time_s)
+        if source.stage == STAGE_DIT:
+            completed_steps = source.current_run.dit_completed_after_elapsed(
+                elapsed_s,
+                self.config.denoising_steps,
+            )
+            return self.estimate_dit_service_time_s(req, target, completed_steps)
+        return self.estimate_stage_service_time_s(req, target, boundary_time_s)
 
     def prepare_short_to_long(
         self,
@@ -934,6 +1535,8 @@ class FlipSimulator:
             for inst in bundle.stage_instances.values():
                 inst.draining = True
                 flip.selected_instance_ids.append(inst.instance_id)
+        for bundle in bundles:
+            for inst in bundle.stage_instances.values():
                 flip.migrated_waiting_requests += self.migrate_waiting(inst, now_s)
                 if inst.current_req_id is None:
                     continue
@@ -961,6 +1564,10 @@ class FlipSimulator:
                     continue
                 inst.draining = True
                 flip.selected_instance_ids.append(inst.instance_id)
+        for bundle in bundles:
+            for inst in bundle.pe_target_instances:
+                if not inst.active:
+                    continue
                 flip.migrated_waiting_requests += self.migrate_waiting(inst, now_s)
                 if inst.current_req_id is None:
                     continue
@@ -993,15 +1600,16 @@ class FlipSimulator:
             for candidate in self.stage_instances[inst.stage]
             if candidate is not inst and candidate.active_ready()
         ]
-        estimated = {candidate.instance_id: candidate.load_count() for candidate in targets}
+        estimated = self.estimated_work_scores(targets, now_s)
         migrated = 0
         while inst.queue:
             req_id, attempt_id = inst.queue.popleft()
             attempt = self.attempts[attempt_id]
             attempt.exit_time_s = now_s
             attempt.exit_reason = "migrated_waiting"
-            target = self.choose_least_waiting(inst.stage, targets, estimated)
-            estimated[target.instance_id] += 1
+            req = self.requests[req_id]
+            target = self.choose_least_waiting(inst.stage, targets, estimated, incoming_req=req, now_s=now_s)
+            estimated[target.instance_id] += self.incoming_load_increment(targets, target, req, now_s)
             self.enqueue_request(self.requests[req_id], target, now_s, queue_insert="tail_migrated", at_head=False)
             self.start_next_if_possible(target, now_s)
             migrated += 1
@@ -1030,8 +1638,14 @@ class FlipSimulator:
             for candidate in self.stage_instances[inst.stage]
             if candidate is not inst and candidate.active_ready()
         ]
-        estimated = {candidate.instance_id: candidate.load_count() for candidate in targets}
-        target = self.choose_least_waiting(inst.stage, targets, estimated)
+        estimated = self.estimated_work_scores(targets, now_s)
+        target = self.choose_least_waiting(
+            inst.stage,
+            targets,
+            estimated,
+            incoming_req=self.requests[old_req_id],
+            now_s=now_s,
+        )
         self.enqueue_request(self.requests[old_req_id], target, now_s, queue_insert="head_migrated", at_head=True)
         self.start_next_if_possible(target, now_s)
         flip.migrated_running_requests += 1
@@ -1073,7 +1687,7 @@ class FlipSimulator:
                     pe_inst.draining = False
                     pe_inst.generation += 1
                     target_instances.append(pe_inst)
-            cold_start_s = self.pe_init_time_s("A800", 2)
+            cold_start_s = self.flip_cold_start_s(flip.direction)
         else:
             for bundle_key in flip.selected_bundle_keys:
                 bundle = self.bundles[bundle_key]
@@ -1095,7 +1709,7 @@ class FlipSimulator:
                 bundle.draining = False
                 if bundle.bundle_key in self.converted_bundle_keys:
                     self.converted_bundle_keys.remove(bundle.bundle_key)
-            cold_start_s = self.generator_init_time_s(8)
+            cold_start_s = self.flip_cold_start_s(flip.direction)
 
         flip.cold_start_done_time_s = now_s + cold_start_s
         flip.cold_start_time_s = now_s
@@ -1158,6 +1772,14 @@ class FlipSimulator:
         summary = {
             "run_id": self.run_id,
             "mode": self.mode,
+            "margin_ratio": self.config.threshold_margin_ratio,
+            "margin_label": margin_label(self.config.threshold_margin_ratio),
+            "threshold_margin_mode": self.config.threshold_margin_mode,
+            "cold_start_mode": self.config.cold_start_mode,
+            "pe_output_estimate_mode": self.config.pe_output_estimate_mode,
+            "threshold_mid": self.threshold_bounds()[0],
+            "threshold_low": self.threshold_bounds()[1],
+            "threshold_high": self.threshold_bounds()[2],
             "request_rate_per_min": self.request_rate_per_min,
             "monitor_window_sec": self.monitor_window_sec,
             "total_requests": len(self.requests),
@@ -1258,27 +1880,45 @@ def run_suite(config: SimulationConfig) -> tuple[list[RunResult], list[DominantI
 
 
 def add_comparison_fields(results: list[RunResult]) -> None:
-    by_case: dict[tuple[float, float], dict[str, RunResult]] = {}
+    baseline_by_case: dict[tuple[float, float], RunResult] = {}
     for result in results:
-        by_case.setdefault((result.request_rate_per_min, result.monitor_window_sec), {})[result.mode] = result
-    for case_results in by_case.values():
-        no_flip = case_results.get(MODE_NO_FLIP)
-        can_flip = case_results.get(MODE_CAN_FLIP)
-        if no_flip is None or can_flip is None:
+        result.summary.setdefault("throughput_vs_no_flip_pct", float("nan"))
+        result.summary.setdefault("slo10_vs_no_flip_delta", float("nan"))
+        result.summary.setdefault("slo5_vs_no_flip_delta", float("nan"))
+        if result.mode != MODE_NO_FLIP:
             continue
-        nf = no_flip.summary
-        cf = can_flip.summary
-        nf["throughput_vs_no_flip_pct"] = 0.0
-        nf["slo10_vs_no_flip_delta"] = 0.0
-        nf["slo5_vs_no_flip_delta"] = 0.0
-        cf["throughput_vs_no_flip_pct"] = (
-            (float(cf["throughput_req_s"]) / float(nf["throughput_req_s"]) - 1.0) * 100.0
+        key = (result.request_rate_per_min, result.monitor_window_sec)
+        if float(result.summary.get("margin_ratio", 0.0)) == 0.0 or key not in baseline_by_case:
+            baseline_by_case[key] = result
+
+    for result in results:
+        key = (result.request_rate_per_min, result.monitor_window_sec)
+        baseline = baseline_by_case.get(key)
+        if baseline is None:
+            continue
+        nf = baseline.summary
+        current = result.summary
+        if result.mode == MODE_NO_FLIP:
+            current["throughput_vs_no_flip_pct"] = 0.0
+            current["slo10_vs_no_flip_delta"] = 0.0
+            current["slo5_vs_no_flip_delta"] = 0.0
+            continue
+        if result.mode != MODE_CAN_FLIP:
+            continue
+        current["throughput_vs_no_flip_pct"] = (
+            (float(current["throughput_req_s"]) / float(nf["throughput_req_s"]) - 1.0) * 100.0
         )
-        cf["slo10_vs_no_flip_delta"] = float(cf["slo10_pass_ratio"]) - float(nf["slo10_pass_ratio"])
-        cf["slo5_vs_no_flip_delta"] = float(cf["slo5_pass_ratio"]) - float(nf["slo5_pass_ratio"])
+        current["slo10_vs_no_flip_delta"] = float(current["slo10_pass_ratio"]) - float(nf["slo10_pass_ratio"])
+        current["slo5_vs_no_flip_delta"] = float(current["slo5_pass_ratio"]) - float(nf["slo5_pass_ratio"])
 
 
-def write_outputs(config: SimulationConfig, results: list[RunResult], intervals: list[DominantInterval]) -> None:
+def write_outputs(
+    config: SimulationConfig,
+    results: list[RunResult],
+    intervals: list[DominantInterval],
+    *,
+    summary_text: str | None = None,
+) -> None:
     config.out_dir.mkdir(parents=True, exist_ok=True)
     write_csv(config.out_dir / "run_summary.csv", [result.summary for result in results])
     write_csv(config.out_dir / "request_stage_events.csv", request_stage_rows(results))
@@ -1288,7 +1928,7 @@ def write_outputs(config: SimulationConfig, results: list[RunResult], intervals:
         json.dumps([result.summary for result in results], indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    (config.out_dir / "summary.md").write_text(render_summary_markdown(results), encoding="utf-8")
+    (config.out_dir / "summary.md").write_text(summary_text or render_summary_markdown(results), encoding="utf-8")
 
 
 def request_stage_rows(results: list[RunResult]) -> list[dict[str, object]]:
@@ -1305,6 +1945,8 @@ def request_stage_rows(results: list[RunResult]) -> list[dict[str, object]]:
                 {
                     "run_id": result.run_id,
                     "mode": result.mode,
+                    "margin_ratio": result.summary.get("margin_ratio", 0.0),
+                    "margin_label": result.summary.get("margin_label", "non_margin"),
                     "request_rate_per_min": result.request_rate_per_min,
                     "monitor_window_sec": result.monitor_window_sec,
                     "request_type": req.request_type,
@@ -1400,6 +2042,140 @@ def render_summary_markdown(results: list[RunResult]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def render_non_margin_summary_from_run_summary_csv(
+    run_summary_csv: Path,
+    *,
+    title: str = "Weighted Dispatch Non-Margin Flip Simulation Summary",
+) -> str:
+    with run_summary_csv.open(newline="", encoding="utf-8") as f:
+        rows = [
+            row
+            for row in csv.DictReader(f)
+            if row.get("margin_label", "non_margin") == "non_margin"
+        ]
+    by_case: dict[tuple[float, float], dict[str, dict[str, str]]] = {}
+    for row in rows:
+        rate = float(row["request_rate_per_min"])
+        window = float(row["monitor_window_sec"])
+        by_case.setdefault((rate, window), {})[row["mode"]] = row
+
+    lines = [f"# {title}", ""]
+    lines.append(
+        "This summary uses the same slot meaning as `td_outputs\\flip_simulation_default\\summary.md`: "
+        "each row is one `(request rate, monitor window)` case. The numbers are filtered to "
+        "`margin_label=non_margin` from the current simulator outputs."
+    )
+    lines.append("")
+    lines.append(f"Source CSV: `{run_summary_csv}`.")
+    lines.append("")
+    lines.append(
+        "| rate req/min | window s | no-flip thpt | can-flip thpt | thpt lift % | "
+        "no-flip SLOx10 | can-flip SLOx10 | SLOx10 delta | no-flip SLOx5 | can-flip SLOx5 | SLOx5 delta |"
+    )
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for rate, window in sorted(by_case):
+        case = by_case[(rate, window)]
+        nf = case.get(MODE_NO_FLIP)
+        cf = case.get(MODE_CAN_FLIP)
+        if nf is None or cf is None:
+            continue
+        lines.append(
+            f"| {rate:g} | {window:g} | {float(nf['throughput_req_s']):.6f} | "
+            f"{float(cf['throughput_req_s']):.6f} | "
+            f"{float(cf['throughput_vs_no_flip_pct']):.3f} | "
+            f"{float(nf['slo10_pass_ratio']):.6f} | {float(cf['slo10_pass_ratio']):.6f} | "
+            f"{float(cf['slo10_vs_no_flip_delta']):.6f} | "
+            f"{float(nf['slo5_pass_ratio']):.6f} | {float(cf['slo5_pass_ratio']):.6f} | "
+            f"{float(cf['slo5_vs_no_flip_delta']):.6f} |"
+        )
+    lines.append("")
+    lines.append("Notes:")
+    lines.append("")
+    lines.append("- `thpt` is finished requests divided by `last_finish_s - first_arrival_s`.")
+    lines.append("- SLO columns use the current weighted SLO baseline implementation.")
+    lines.append("- `thpt lift %`, `SLOx10 delta`, and `SLOx5 delta` are can-flip relative to no-flip for the same slot.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_margin_comparison_markdown(results: list[RunResult], margin_ratio: float) -> str:
+    margin_name = margin_label(margin_ratio)
+    by_key: dict[tuple[float, float, str, str], RunResult] = {}
+    rates = set()
+    windows = set()
+    for result in results:
+        label = str(result.summary.get("margin_label", "non_margin"))
+        by_key[(result.request_rate_per_min, result.monitor_window_sec, result.mode, label)] = result
+        rates.add(result.request_rate_per_min)
+        windows.add(result.monitor_window_sec)
+
+    lines = [f"# Margin Comparison: a={margin_ratio:.2f}", ""]
+    lines.append(
+        "Each margin column is the can-flip result with hysteresis margin. "
+        "Each non-margin column is the can-flip result with `a=0`, using the same no-flip baseline."
+    )
+    lines.append("")
+    for rate in sorted(rates):
+        lines.append(f"## Request Rate {rate:g} req/min")
+        lines.append("")
+        lines.append(
+            "| window s | throughput lift non-margin % | throughput lift margin % | "
+            "SLOx10 delta non-margin | SLOx10 delta margin | "
+            "SLOx5 delta non-margin | SLOx5 delta margin |"
+        )
+        lines.append("|---:|---:|---:|---:|---:|---:|---:|")
+        for window in sorted(windows):
+            non_margin = by_key.get((rate, window, MODE_CAN_FLIP, "non_margin"))
+            margin = by_key.get((rate, window, MODE_CAN_FLIP, margin_name))
+            if non_margin is None or margin is None:
+                continue
+            lines.append(
+                f"| {window:g} | "
+                f"{float(non_margin.summary['throughput_vs_no_flip_pct']):.3f} | "
+                f"{float(margin.summary['throughput_vs_no_flip_pct']):.3f} | "
+                f"{float(non_margin.summary['slo10_vs_no_flip_delta']):.6f} | "
+                f"{float(margin.summary['slo10_vs_no_flip_delta']):.6f} | "
+                f"{float(non_margin.summary['slo5_vs_no_flip_delta']):.6f} | "
+                f"{float(margin.summary['slo5_vs_no_flip_delta']):.6f} |"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def run_margin_comparisons(config: SimulationConfig) -> None:
+    rollup_lines = ["# Threshold Margin Comparison Rollup", ""]
+    rollup_lines.append("| margin ratio | output directory |")
+    rollup_lines.append("|---:|---|")
+    base_config = replace(
+        config,
+        mode="both",
+        threshold_margin_ratio=0.0,
+        compare_threshold_margin_ratios=(),
+    )
+    base_results, intervals = run_suite(base_config)
+    for ratio in config.compare_threshold_margin_ratios:
+        label = margin_label(ratio)
+        out_dir = config.out_dir / label
+        margin_config = replace(
+            config,
+            out_dir=out_dir,
+            mode=MODE_CAN_FLIP,
+            threshold_margin_ratio=ratio,
+            compare_threshold_margin_ratios=(),
+        )
+        margin_results, _ = run_suite(margin_config)
+        results = base_results + margin_results
+        add_comparison_fields(results)
+        summary_text = render_margin_comparison_markdown(results, ratio)
+        output_config = replace(base_config, out_dir=out_dir)
+        write_outputs(output_config, results, intervals, summary_text=summary_text)
+        rollup_lines.append(f"| {ratio:.2f} | `{label}/` |")
+    config.out_dir.mkdir(parents=True, exist_ok=True)
+    (config.out_dir / "margin_comparison_rollup.md").write_text(
+        "\n".join(rollup_lines).rstrip() + "\n",
+        encoding="utf-8",
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="WAN2.2 Group 1 PE-output flip/re-flip simulator.")
     parser.add_argument("--dominant-intervals-csv", type=Path, default=DEFAULT_DOMINANT_INTERVALS_CSV)
@@ -1408,6 +2184,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--monitor-windows-sec", type=float, nargs="+", default=None)
     parser.add_argument("--duration-min", type=float, default=None)
     parser.add_argument("--token-threshold", type=float, default=1280.0)
+    parser.add_argument("--threshold-margin-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--threshold-margin-mode",
+        choices=[MARGIN_MODE_HYSTERESIS, MARGIN_MODE_SINGLE],
+        default=MARGIN_MODE_HYSTERESIS,
+    )
+    parser.add_argument("--compare-threshold-margin-ratios", type=float, nargs="+", default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mode", choices=["no_flip", "can_flip", "both"], default="both")
     parser.add_argument("--pe-model", default="pe7b")
@@ -1420,6 +2203,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deployment-preset", default=None)
     parser.add_argument("--flip-plan-preset", default="wan22_group1_restricted")
     parser.add_argument("--flip-source-count", type=int, default=None)
+    parser.add_argument(
+        "--cold-start-mode",
+        choices=[COLD_START_MODE_PROFILE, COLD_START_MODE_ZERO],
+        default=COLD_START_MODE_PROFILE,
+    )
+    parser.add_argument(
+        "--pe-output-estimate-mode",
+        choices=[PE_OUTPUT_ESTIMATE_MODE_MONITOR, PE_OUTPUT_ESTIMATE_MODE_ORACLE],
+        default=PE_OUTPUT_ESTIMATE_MODE_MONITOR,
+    )
     parser.add_argument("--trace-start", default=DEFAULT_TRACE_START)
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -1439,6 +2232,9 @@ def config_from_args(args: argparse.Namespace) -> SimulationConfig:
         monitor_windows_sec=windows,
         duration_min=duration,
         token_threshold=args.token_threshold,
+        threshold_margin_ratio=args.threshold_margin_ratio,
+        threshold_margin_mode=args.threshold_margin_mode,
+        compare_threshold_margin_ratios=tuple(args.compare_threshold_margin_ratios or ()),
         seed=args.seed,
         mode=args.mode,
         pe_model=args.pe_model,
@@ -1451,6 +2247,8 @@ def config_from_args(args: argparse.Namespace) -> SimulationConfig:
         deployment_preset=deployment,
         flip_plan_preset=args.flip_plan_preset,
         flip_source_count=flip_source_count,
+        cold_start_mode=args.cold_start_mode,
+        pe_output_estimate_mode=args.pe_output_estimate_mode,
         trace_start=args.trace_start,
         verbose=args.verbose,
     )
@@ -1460,9 +2258,14 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     config = config_from_args(args)
+    if config.compare_threshold_margin_ratios:
+        run_margin_comparisons(config)
+        print(f"Wrote margin comparison outputs to: {config.out_dir}")
+        return
     results, intervals = run_suite(config)
-    write_outputs(config, results, intervals)
-    print(render_summary_markdown(results))
+    summary_text = render_summary_markdown(results)
+    write_outputs(config, results, intervals, summary_text=summary_text)
+    print(summary_text)
     print(f"Wrote outputs to: {config.out_dir}")
 
 
