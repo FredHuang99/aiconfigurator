@@ -9,7 +9,11 @@ import pytest
 
 from aiconfigurator.td_deployment_search.flip_simulation import (
     COLD_START_MODE_ZERO,
+    GENERATOR_INIT_TIME_MODE_OPTIMIZED,
+    GENERATOR_INIT_TIME_MODE_PROFILE,
     MODE_CAN_FLIP,
+    PE_INIT_TIME_MODE_NON_OPTIMIZED,
+    PE_INIT_TIME_MODE_OPTIMIZED,
     PE_OUTPUT_ESTIMATE_MODE_ORACLE,
     STAGE_DIT,
     STAGE_VAE,
@@ -17,12 +21,14 @@ from aiconfigurator.td_deployment_search.flip_simulation import (
     FlipSimulator,
     SimulationConfig,
     StageRun,
+    add_cold_start_optimization_fields,
     add_comparison_fields,
     build_requests,
     config_from_args,
     load_dominant_intervals,
     margin_label,
     render_margin_comparison_markdown,
+    render_cold_start_optimization_markdown,
     render_non_margin_summary_from_run_summary_csv,
     run_suite,
     smoke_intervals,
@@ -488,6 +494,85 @@ def test_zero_cold_start_finishes_at_cold_start_begin():
     assert all(event.selection_restart_ready_delay_s < 1.0 for event in can_flip.flip_events)
 
 
+def test_cold_start_init_time_modes_select_expected_profile_values():
+    baseline_config = SimulationConfig(
+        scenario="smoke",
+        deployment_preset="smoke",
+        flip_source_count=1,
+        pe_init_time_mode=PE_INIT_TIME_MODE_NON_OPTIMIZED,
+        generator_init_time_mode=GENERATOR_INIT_TIME_MODE_PROFILE,
+    )
+    optimized_config = SimulationConfig(
+        scenario="smoke",
+        deployment_preset="smoke",
+        flip_source_count=1,
+        pe_init_time_mode=PE_INIT_TIME_MODE_OPTIMIZED,
+        generator_init_time_mode=GENERATOR_INIT_TIME_MODE_OPTIMIZED,
+    )
+    baseline = FlipSimulator(
+        config=baseline_config,
+        catalog=ProfileCatalog(),
+        intervals=smoke_intervals(),
+        request_rate_per_min=12,
+        monitor_window_sec=10,
+        mode=MODE_CAN_FLIP,
+    )
+    optimized = FlipSimulator(
+        config=optimized_config,
+        catalog=ProfileCatalog(),
+        intervals=smoke_intervals(),
+        request_rate_per_min=12,
+        monitor_window_sec=10,
+        mode=MODE_CAN_FLIP,
+    )
+
+    assert baseline.pe_init_time_s("A800", 2) == pytest.approx(29.624)
+    assert optimized.pe_init_time_s("A800", 2) == pytest.approx(20.963828)
+    assert baseline.generator_init_time_s(8) == pytest.approx(61.020383)
+    assert optimized.generator_init_time_s(8) == pytest.approx(37.61)
+
+
+def test_cold_start_optimization_summary_compares_same_margin_variants():
+    base_config = SimulationConfig(
+        scenario="smoke",
+        deployment_preset="smoke",
+        request_rates_per_min=(12.0,),
+        monitor_windows_sec=(10.0,),
+        duration_min=6.0,
+        flip_source_count=1,
+        mode=MODE_CAN_FLIP,
+        threshold_margin_ratio=0.05,
+        pe_init_time_mode=PE_INIT_TIME_MODE_NON_OPTIMIZED,
+        generator_init_time_mode=GENERATOR_INIT_TIME_MODE_PROFILE,
+    )
+    optimized_config = SimulationConfig(
+        scenario="smoke",
+        deployment_preset="smoke",
+        request_rates_per_min=(12.0,),
+        monitor_windows_sec=(10.0,),
+        duration_min=6.0,
+        flip_source_count=1,
+        mode=MODE_CAN_FLIP,
+        threshold_margin_ratio=0.05,
+        pe_init_time_mode=PE_INIT_TIME_MODE_OPTIMIZED,
+        generator_init_time_mode=GENERATOR_INIT_TIME_MODE_OPTIMIZED,
+    )
+    base_results, _ = run_suite(base_config)
+    optimized_results, _ = run_suite(optimized_config)
+    results = base_results + optimized_results
+    add_cold_start_optimization_fields(results)
+    text = render_cold_start_optimization_markdown(results, 0.05)
+
+    optimized = next(result for result in results if result.summary["cold_start_variant"] == "optimized")
+    assert "Cold-Start Optimization Comparison" in text
+    assert "baseline thpt" in text
+    assert "optimized thpt" in text
+    assert "cold_start_throughput_lift_pct" not in text
+    assert optimized.summary["cold_start_throughput_lift_pct"] == pytest.approx(
+        (optimized.summary["throughput_req_s"] / base_results[0].summary["throughput_req_s"] - 1.0) * 100.0
+    )
+
+
 def test_margin_comparison_summary_groups_by_rate_and_window():
     base_config = SimulationConfig(
         scenario="smoke",
@@ -616,6 +701,9 @@ def test_parser_smoke_defaults_are_small():
                 "flip_source_count": None,
                 "cold_start_mode": "profile",
                 "pe_output_estimate_mode": "monitor",
+                "pe_init_time_mode": "optimized",
+                "generator_init_time_mode": "profile",
+                "compare_cold_start_optimization": False,
                 "trace_start": "2024-10-15T12:00:00+00:00",
                 "verbose": False,
             },

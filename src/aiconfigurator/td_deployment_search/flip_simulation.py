@@ -37,6 +37,10 @@ COLD_START_MODE_PROFILE = "profile"
 COLD_START_MODE_ZERO = "zero"
 PE_OUTPUT_ESTIMATE_MODE_MONITOR = "monitor"
 PE_OUTPUT_ESTIMATE_MODE_ORACLE = "oracle"
+PE_INIT_TIME_MODE_OPTIMIZED = "optimized"
+PE_INIT_TIME_MODE_NON_OPTIMIZED = "non_optimized"
+GENERATOR_INIT_TIME_MODE_PROFILE = "profile"
+GENERATOR_INIT_TIME_MODE_OPTIMIZED = "optimized"
 EPS = 1e-9
 
 DEFAULT_DOMINANT_INTERVALS_CSV = Path(
@@ -89,6 +93,9 @@ class SimulationConfig:
     flip_source_count: int = 2
     cold_start_mode: str = COLD_START_MODE_PROFILE
     pe_output_estimate_mode: str = PE_OUTPUT_ESTIMATE_MODE_MONITOR
+    pe_init_time_mode: str = PE_INIT_TIME_MODE_OPTIMIZED
+    generator_init_time_mode: str = GENERATOR_INIT_TIME_MODE_PROFILE
+    compare_cold_start_optimization: bool = False
     trace_start: str = DEFAULT_TRACE_START
     verbose: bool = False
 
@@ -453,6 +460,10 @@ class FlipSimulator:
         run_suffix_parts = [margin_label(config.threshold_margin_ratio)]
         if config.cold_start_mode != COLD_START_MODE_PROFILE:
             run_suffix_parts.append(f"cold_{config.cold_start_mode}")
+        if config.pe_init_time_mode != PE_INIT_TIME_MODE_OPTIMIZED:
+            run_suffix_parts.append(f"pe_init_{config.pe_init_time_mode}")
+        if config.generator_init_time_mode != GENERATOR_INIT_TIME_MODE_PROFILE:
+            run_suffix_parts.append(f"gen_init_{config.generator_init_time_mode}")
         if config.pe_output_estimate_mode != PE_OUTPUT_ESTIMATE_MODE_MONITOR:
             run_suffix_parts.append(f"pe_est_{config.pe_output_estimate_mode}")
         self.run_id = (
@@ -1728,15 +1739,44 @@ class FlipSimulator:
 
     def pe_init_time_s(self, gpu_type: str, parallelism: int) -> float:
         hardware = self.catalog.profile_data.pe_models[self.config.pe_model].hardware[gpu_type]
-        if parallelism not in hardware.init_time_s:
-            raise KeyError(f"Missing PE init time for {self.config.pe_model} {gpu_type} P{parallelism}")
-        return hardware.init_time_s[parallelism]
+        if self.config.pe_init_time_mode == PE_INIT_TIME_MODE_OPTIMIZED:
+            table = hardware.init_time_s
+            label = "optimized"
+        elif self.config.pe_init_time_mode == PE_INIT_TIME_MODE_NON_OPTIMIZED:
+            table = hardware.non_optimized_init_time_s
+            label = "non-optimized"
+        else:
+            raise ValueError(f"Unsupported PE init time mode: {self.config.pe_init_time_mode}")
+        if parallelism not in table:
+            raise KeyError(f"Missing {label} PE init time for {self.config.pe_model} {gpu_type} P{parallelism}")
+        return table[parallelism]
 
     def generator_init_time_s(self, parallelism: int) -> float:
         generator = self.catalog.generator_profile(self.config.generator_model)
-        if parallelism not in generator.init_time_s:
-            raise KeyError(f"Missing generator init time for {generator.name} P{parallelism}")
-        return generator.init_time_s[parallelism]
+        if self.config.generator_init_time_mode == GENERATOR_INIT_TIME_MODE_PROFILE:
+            table = generator.init_time_s
+            label = "profile"
+        elif self.config.generator_init_time_mode == GENERATOR_INIT_TIME_MODE_OPTIMIZED:
+            table = generator.optimized_init_time_s
+            label = "optimized"
+        else:
+            raise ValueError(f"Unsupported generator init time mode: {self.config.generator_init_time_mode}")
+        if parallelism not in table:
+            raise KeyError(f"Missing {label} generator init time for {generator.name} P{parallelism}")
+        return table[parallelism]
+
+    def cold_start_variant_label(self) -> str:
+        if (
+            self.config.pe_init_time_mode == PE_INIT_TIME_MODE_NON_OPTIMIZED
+            and self.config.generator_init_time_mode == GENERATOR_INIT_TIME_MODE_PROFILE
+        ):
+            return "non_optimized"
+        if (
+            self.config.pe_init_time_mode == PE_INIT_TIME_MODE_OPTIMIZED
+            and self.config.generator_init_time_mode == GENERATOR_INIT_TIME_MODE_OPTIMIZED
+        ):
+            return "optimized"
+        return f"pe_{self.config.pe_init_time_mode}_gen_{self.config.generator_init_time_mode}"
 
     def find_trace_change_time(self, direction: str, detect_time_s: float) -> float | None:
         want = ("Short", "Long") if direction == "short_to_long" else ("Long", "Short")
@@ -1777,6 +1817,9 @@ class FlipSimulator:
             "threshold_margin_mode": self.config.threshold_margin_mode,
             "cold_start_mode": self.config.cold_start_mode,
             "pe_output_estimate_mode": self.config.pe_output_estimate_mode,
+            "pe_init_time_mode": self.config.pe_init_time_mode,
+            "generator_init_time_mode": self.config.generator_init_time_mode,
+            "cold_start_variant": self.cold_start_variant_label(),
             "threshold_mid": self.threshold_bounds()[0],
             "threshold_low": self.threshold_bounds()[1],
             "threshold_high": self.threshold_bounds()[2],
@@ -2141,6 +2184,155 @@ def render_margin_comparison_markdown(results: list[RunResult], margin_ratio: fl
     return "\n".join(lines).rstrip() + "\n"
 
 
+def add_cold_start_optimization_fields(results: list[RunResult]) -> None:
+    baseline_by_case: dict[tuple[float, float, str], RunResult] = {}
+    for result in results:
+        result.summary.setdefault("cold_start_throughput_lift_pct", float("nan"))
+        result.summary.setdefault("cold_start_slo10_delta", float("nan"))
+        result.summary.setdefault("cold_start_slo5_delta", float("nan"))
+        result.summary.setdefault("cold_start_flip_event_delta", float("nan"))
+        if result.mode != MODE_CAN_FLIP:
+            continue
+        if result.summary.get("cold_start_variant") != "non_optimized":
+            continue
+        key = (
+            result.request_rate_per_min,
+            result.monitor_window_sec,
+            str(result.summary.get("margin_label", "non_margin")),
+        )
+        baseline_by_case[key] = result
+
+    for result in results:
+        if result.mode != MODE_CAN_FLIP:
+            continue
+        key = (
+            result.request_rate_per_min,
+            result.monitor_window_sec,
+            str(result.summary.get("margin_label", "non_margin")),
+        )
+        baseline = baseline_by_case.get(key)
+        if baseline is None:
+            continue
+        if result.summary.get("cold_start_variant") == "non_optimized":
+            result.summary["cold_start_throughput_lift_pct"] = 0.0
+            result.summary["cold_start_slo10_delta"] = 0.0
+            result.summary["cold_start_slo5_delta"] = 0.0
+            result.summary["cold_start_flip_event_delta"] = 0
+            continue
+        result.summary["cold_start_throughput_lift_pct"] = (
+            float(result.summary["throughput_req_s"]) / float(baseline.summary["throughput_req_s"]) - 1.0
+        ) * 100.0
+        result.summary["cold_start_slo10_delta"] = (
+            float(result.summary["slo10_pass_ratio"]) - float(baseline.summary["slo10_pass_ratio"])
+        )
+        result.summary["cold_start_slo5_delta"] = (
+            float(result.summary["slo5_pass_ratio"]) - float(baseline.summary["slo5_pass_ratio"])
+        )
+        result.summary["cold_start_flip_event_delta"] = (
+            int(result.summary["num_flip_events"]) - int(baseline.summary["num_flip_events"])
+        )
+
+
+def render_cold_start_optimization_markdown(results: list[RunResult], margin_ratio: float) -> str:
+    by_key: dict[tuple[float, float, str], RunResult] = {}
+    rates = set()
+    windows = set()
+    for result in results:
+        if result.mode != MODE_CAN_FLIP:
+            continue
+        variant = str(result.summary.get("cold_start_variant", ""))
+        by_key[(result.request_rate_per_min, result.monitor_window_sec, variant)] = result
+        rates.add(result.request_rate_per_min)
+        windows.add(result.monitor_window_sec)
+
+    lines = [f"# Cold-Start Optimization Comparison: margin a={margin_ratio:.2f}", ""]
+    lines.append(
+        "Baseline uses non-optimized PE launch time and profile generator launch time. "
+        "Optimized uses optimized PE launch time and optimized generator launch time. "
+        "Both runs use the same margin, trace, request rate, monitor window, dispatch, and flip plan."
+    )
+    lines.append("")
+    lines.append(
+        "Expected cold-start durations: PE A800 P2 `29.624s -> 20.963828s`; "
+        "WAN2.2 generator P8 `61.020383s -> 37.61s`."
+    )
+    lines.append("")
+    for rate in sorted(rates):
+        lines.append(f"## Request Rate {rate:g} req/min")
+        lines.append("")
+        lines.append(
+            "| window s | baseline thpt | optimized thpt | thpt lift % | "
+            "baseline SLOx10 | optimized SLOx10 | SLOx10 delta | "
+            "baseline SLOx5 | optimized SLOx5 | SLOx5 delta | "
+            "baseline flips | optimized flips | flip delta |"
+        )
+        lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for window in sorted(windows):
+            baseline = by_key.get((rate, window, "non_optimized"))
+            optimized = by_key.get((rate, window, "optimized"))
+            if baseline is None or optimized is None:
+                continue
+            lines.append(
+                f"| {window:g} | "
+                f"{float(baseline.summary['throughput_req_s']):.6f} | "
+                f"{float(optimized.summary['throughput_req_s']):.6f} | "
+                f"{float(optimized.summary['cold_start_throughput_lift_pct']):.3f} | "
+                f"{float(baseline.summary['slo10_pass_ratio']):.6f} | "
+                f"{float(optimized.summary['slo10_pass_ratio']):.6f} | "
+                f"{float(optimized.summary['cold_start_slo10_delta']):.6f} | "
+                f"{float(baseline.summary['slo5_pass_ratio']):.6f} | "
+                f"{float(optimized.summary['slo5_pass_ratio']):.6f} | "
+                f"{float(optimized.summary['cold_start_slo5_delta']):.6f} | "
+                f"{int(baseline.summary['num_flip_events'])} | "
+                f"{int(optimized.summary['num_flip_events'])} | "
+                f"{int(optimized.summary['cold_start_flip_event_delta'])} |"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def run_cold_start_optimization_comparisons(config: SimulationConfig) -> None:
+    ratios = config.compare_threshold_margin_ratios or (config.threshold_margin_ratio,)
+    rollup_lines = ["# Cold-Start Optimization Comparison Rollup", ""]
+    rollup_lines.append("| margin ratio | output directory |")
+    rollup_lines.append("|---:|---|")
+    for ratio in ratios:
+        label = margin_label(ratio)
+        out_dir = config.out_dir / label
+        baseline_config = replace(
+            config,
+            out_dir=out_dir,
+            mode=MODE_CAN_FLIP,
+            threshold_margin_ratio=ratio,
+            compare_threshold_margin_ratios=(),
+            compare_cold_start_optimization=False,
+            pe_init_time_mode=PE_INIT_TIME_MODE_NON_OPTIMIZED,
+            generator_init_time_mode=GENERATOR_INIT_TIME_MODE_PROFILE,
+        )
+        optimized_config = replace(
+            config,
+            out_dir=out_dir,
+            mode=MODE_CAN_FLIP,
+            threshold_margin_ratio=ratio,
+            compare_threshold_margin_ratios=(),
+            compare_cold_start_optimization=False,
+            pe_init_time_mode=PE_INIT_TIME_MODE_OPTIMIZED,
+            generator_init_time_mode=GENERATOR_INIT_TIME_MODE_OPTIMIZED,
+        )
+        baseline_results, intervals = run_suite(baseline_config)
+        optimized_results, _ = run_suite(optimized_config)
+        results = baseline_results + optimized_results
+        add_cold_start_optimization_fields(results)
+        summary_text = render_cold_start_optimization_markdown(results, ratio)
+        write_outputs(replace(config, out_dir=out_dir), results, intervals, summary_text=summary_text)
+        rollup_lines.append(f"| {ratio:.2f} | `{label}/` |")
+    config.out_dir.mkdir(parents=True, exist_ok=True)
+    (config.out_dir / "cold_start_optimization_rollup.md").write_text(
+        "\n".join(rollup_lines).rstrip() + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_margin_comparisons(config: SimulationConfig) -> None:
     rollup_lines = ["# Threshold Margin Comparison Rollup", ""]
     rollup_lines.append("| margin ratio | output directory |")
@@ -2213,6 +2405,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=[PE_OUTPUT_ESTIMATE_MODE_MONITOR, PE_OUTPUT_ESTIMATE_MODE_ORACLE],
         default=PE_OUTPUT_ESTIMATE_MODE_MONITOR,
     )
+    parser.add_argument(
+        "--pe-init-time-mode",
+        choices=[PE_INIT_TIME_MODE_OPTIMIZED, PE_INIT_TIME_MODE_NON_OPTIMIZED],
+        default=PE_INIT_TIME_MODE_OPTIMIZED,
+    )
+    parser.add_argument(
+        "--generator-init-time-mode",
+        choices=[GENERATOR_INIT_TIME_MODE_PROFILE, GENERATOR_INIT_TIME_MODE_OPTIMIZED],
+        default=GENERATOR_INIT_TIME_MODE_PROFILE,
+    )
+    parser.add_argument("--compare-cold-start-optimization", action="store_true")
     parser.add_argument("--trace-start", default=DEFAULT_TRACE_START)
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -2249,6 +2452,9 @@ def config_from_args(args: argparse.Namespace) -> SimulationConfig:
         flip_source_count=flip_source_count,
         cold_start_mode=args.cold_start_mode,
         pe_output_estimate_mode=args.pe_output_estimate_mode,
+        pe_init_time_mode=args.pe_init_time_mode,
+        generator_init_time_mode=args.generator_init_time_mode,
+        compare_cold_start_optimization=args.compare_cold_start_optimization,
         trace_start=args.trace_start,
         verbose=args.verbose,
     )
@@ -2258,6 +2464,10 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     config = config_from_args(args)
+    if config.compare_cold_start_optimization:
+        run_cold_start_optimization_comparisons(config)
+        print(f"Wrote cold-start optimization comparison outputs to: {config.out_dir}")
+        return
     if config.compare_threshold_margin_ratios:
         run_margin_comparisons(config)
         print(f"Wrote margin comparison outputs to: {config.out_dir}")

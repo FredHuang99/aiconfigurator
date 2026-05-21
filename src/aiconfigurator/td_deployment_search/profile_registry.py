@@ -26,6 +26,7 @@ class PEHardwareProfile:
     sim_ttft_ms: dict[int, dict[int, dict[int, float]]] | None = None
     sim_tpot_ms: dict[int, dict[int, dict[int, float]]] | None = None
     init_time_s: dict[int, float] = field(default_factory=dict)
+    non_optimized_init_time_s: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class GeneratorModelProfile:
     dit: dict[str, StageHardwareProfile]
     vae: dict[str, StageHardwareProfile]
     init_time_s: dict[int, float] = field(default_factory=dict)
+    optimized_init_time_s: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ def _generator_hardware_profiles(
 
 def build_default_profile_data() -> TDProfileData:
     pe7b_init_time_s = {8: 20.982828, 4: 19.974589, 2: 20.963828, 1: 19.95004}
+    pe7b_init_time_non_optimized_s = {8: 39.77, 4: 29.651, 2: 29.624, 1: 28.004}
     pe7b_a800_memory = MemoryProfile(
         {
             "weights": {1: 13.99, 2: 7.01, 4: 3.51, 8: 1.76},
@@ -229,6 +232,7 @@ def build_default_profile_data() -> TDProfileData:
                 sim_ttft_ms=pe7b_a800_simu_ttft,
                 sim_tpot_ms=pe7b_a800_simu_tpot,
                 init_time_s=pe7b_init_time_s,
+                non_optimized_init_time_s=pe7b_init_time_non_optimized_s,
             ),
             "A100": PEHardwareProfile(
                 ttft_ms={
@@ -252,6 +256,7 @@ def build_default_profile_data() -> TDProfileData:
                 ),
                 source_note="PE7B A100 NVLink latency; A800 memory reused for TP8",
                 init_time_s=pe7b_init_time_s,
+                non_optimized_init_time_s=pe7b_init_time_non_optimized_s,
             ),
             "H100": PEHardwareProfile(
                 ttft_ms=pe7b_h100_latency_ttft,
@@ -261,6 +266,7 @@ def build_default_profile_data() -> TDProfileData:
                 sim_ttft_ms=pe7b_h100_latency_ttft,
                 sim_tpot_ms=pe7b_h100_latency_tpot,
                 init_time_s=pe7b_init_time_s,
+                non_optimized_init_time_s=pe7b_init_time_non_optimized_s,
             ),
         },
     )
@@ -301,6 +307,7 @@ def build_default_profile_data() -> TDProfileData:
             "WAN2.2 VAE",
         ),
         init_time_s={1: 24.447095, 2: 28.080947, 4: 40.251256, 8: 61.020383},
+        optimized_init_time_s={1: 24.47, 2: 26.28, 4: 29.69, 8: 37.61}
     )
 
     wan21_encoder_memory = MemoryProfile(

@@ -14,10 +14,21 @@ from aiconfigurator.td_deployment_search.models import (
     StageProfile,
     TemplateProfile,
 )
-from aiconfigurator.td_deployment_search.planner import (
-    build_default_resource_groups,
-    solve_group,
-)
+try:
+    from aiconfigurator.td_deployment_search.planner import (
+        build_default_resource_groups,
+        solve_group,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "scipy":
+        raise
+    _planner_import_error = exc
+
+    def build_default_resource_groups(*args, **kwargs):
+        raise ModuleNotFoundError("scipy is required for TD deployment planning") from _planner_import_error
+
+    def solve_group(*args, **kwargs):
+        raise ModuleNotFoundError("scipy is required for TD deployment planning") from _planner_import_error
 from aiconfigurator.td_deployment_search.profiles import (
     DEFAULT_PROFILE_DATA_PATH,
     ProfileCatalog,
